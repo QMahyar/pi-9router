@@ -83,6 +83,8 @@ interface ToolsConfigSlice {
 	lastSync?: string;
 	capabilities?: Partial<Record<CapId, CapState>>;
 	outputDir?: string;
+	/** Inline generated images into the conversation as base64 (default false) */
+	attachImages?: boolean;
 }
 
 interface CapDef {
@@ -305,6 +307,22 @@ export function resolveModel(cfg: ToolsConfigSlice, cap: CapDef, override?: stri
 
 /** Max concrete ids to spell out per capability before summarising the rest. */
 const MAX_LISTED_MODELS = 14;
+
+/**
+ * Whether to inline a generated image into the conversation. Off by default.
+ *
+ * The attachment is consumed by the *chat* model, not the image model that
+ * produced it, and it is resent on every subsequent turn. A 2 MB generation is
+ * ~2.7M base64 chars (~675k tokens), which overflows most context windows and
+ * surfaces as an opaque "Upstream request failed" well after the file was
+ * written successfully — and text-only models reject it outright.
+ *
+ * Returning the path instead leaves the decision to pi, which reads and
+ * downsizes images natively when the model supports vision.
+ */
+function shouldAttachImage(cfg: ToolsConfigSlice): boolean {
+	return cfg.attachImages === true;
+}
 
 /**
  * Render the capability's available ids for the tool description.
@@ -648,6 +666,7 @@ async function showStatus(ui: ExtensionContext["ui"], cfg: ToolsConfigSlice): Pr
 		`Endpoint     ${endpointOf(cfg)}`,
 		`Catalog      ${cfg.lastSync ? new Date(cfg.lastSync).toLocaleString() : "never synced"}`,
 		`Output       ${outputDirOf(cfg)}`,
+		`Inline image ${shouldAttachImage(cfg) ? "on (base64 in tool result)" : "off — path only"}`,
 		`Tools on     ${on} / ${CAPS.length}`,
 		`Config       ${CONFIG_PATH}`,
 		"",
@@ -673,11 +692,30 @@ async function runToolsUI(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void
 			: "Catalog empty — run /9router → Sync models";
 
 		const rows = CAPS.map((c) => capRow(cfg, c));
-		const menu = [...rows, "─".repeat(48), "Output folder", "Status", "Close"];
+		const attLabel = `Inline generated images: ${shouldAttachImage(cfg) ? "on" : "off (recommended)"}`;
+		const menu = [...rows, "─".repeat(48), attLabel, "Output folder", "Status", "Close"];
 
 		const choice = await ui.select(`9Router Tools\n${header}`, menu);
 		if (!choice || choice === "Close") break;
 		if (choice.startsWith("─")) continue;
+
+		if (choice.startsWith("Inline generated images")) {
+			const pick = await ui.select("Embed generated images in the conversation?", [
+				"Off — return the file path only (recommended)",
+				"On — embed base64 in the tool result",
+				"Back",
+			]);
+			if (!pick || pick === "Back") continue;
+			const on = pick.startsWith("On");
+			cfg = saveRaw({ attachImages: on });
+			ui.notify(
+				on
+					? "Images embedded — large generations can exceed the chat model's context"
+					: "Images saved to disk; pi reads the file when the model supports it",
+				on ? "warning" : "info",
+			);
+			continue;
+		}
 
 		if (choice === "Output folder") {
 			const next = await ui.input("Folder for generated images/audio", outputDirOf(cfg));
@@ -730,7 +768,7 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 		description: withModels(
 			cfg,
 			cap,
-			"Generate an image through 9Router and save it to disk. Best for icons, logos, illustrations, UI mockups, and concept art. Returns the file path.",
+			"Generate an image through 9Router and save it to disk. Best for icons, logos, illustrations, UI mockups, and concept art. Returns the saved file path; the image itself is not embedded in the result, so read the path if you need to view it.",
 		),
 		promptSnippet: "Generate an image (9Router) and save the file path",
 		promptGuidelines: [
@@ -738,6 +776,7 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			"Write a detailed prompt (subject, style, colors, composition).",
 			"Omit model unless the user names a specific image model; when they do, use an exact id from the tool description. Optional size, quality, n, filename.",
 			"Tell the user the saved file path from the tool result.",
+			"The image is not embedded in the result — read the returned path if you need to see it.",
 		],
 		parameters: Type.Object({
 			prompt: Type.String({ description: "Image prompt: subject, style, colors, composition" }),
@@ -813,20 +852,34 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 				| { type: "text"; text: string }
 				| { type: "image"; source: { type: "base64"; mediaType: string; data: string } }
 			> = [{ type: "text", text }];
-			try {
-				const first = saved[0];
-				const st = statSync(first);
-				if (st.size > 0 && st.size < 4_000_000) {
-					const bytes = readFileSync(first);
-					const ext = extname(first).toLowerCase();
-					const mediaType =
-						ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" : ext === ".webp" ? "image/webp" : "image/png";
-					content.push({ type: "image", source: { type: "base64", mediaType, data: bytes.toString("base64") } });
+
+			// Opt-in only — see shouldAttachImage. By default the tool returns just the
+			// path and lets pi read the file if the model can use it.
+			let attached = false;
+			if (shouldAttachImage(cfg)) {
+				try {
+					const first = saved[0];
+					const st = statSync(first);
+					if (st.size > 0) {
+						const bytes = readFileSync(first);
+						const ext = extname(first).toLowerCase();
+						const mediaType =
+							ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" : ext === ".webp" ? "image/webp" : "image/png";
+						content.push({
+							type: "image",
+							source: { type: "base64", mediaType, data: bytes.toString("base64") },
+						});
+						attached = true;
+					}
+				} catch {
+					/* fall through — the path is already in the text */
 				}
-			} catch {
-				/* */
 			}
-			return { content, details: { model, files: saved, prompt: params.prompt, cwd: ctx.cwd } };
+
+			return {
+				content,
+				details: { model, files: saved, prompt: params.prompt, cwd: ctx.cwd, attached },
+			};
 		},
 		renderResult(result, { expanded }, theme) {
 			const d = (result.details || {}) as { files?: string[]; model?: string };

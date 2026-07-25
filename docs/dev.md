@@ -24,6 +24,11 @@ proxy, and listing dead models is worse than omitting them.
 **Tool descriptions** embed the catalog ids, so `registerAll()` re-runs on
 `9router:synced`; `registerTool` keys on tool name, so re-registering replaces cleanly.
 
+**Generated media stays out of the context by default.** `nr_image_generate` returns the
+saved path, not base64 (`attachImages` opts in). Tool results are resent every turn, so a
+1–2 MB image is ~675k tokens of permanent context — it overflows the *chat* model, which
+is unrelated to the image model that produced it. pi reads image files natively.
+
 **`model` on the wire is not always the catalog id.** `/v1/images/generations`,
 `/v1/audio/speech` and `/v1/embeddings` take the full id (`nb/nanobanana-flash`), but
 `/v1/search` and `/v1/web/fetch` take a bare provider name — `exa`, not `exa/search`,

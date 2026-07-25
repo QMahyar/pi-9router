@@ -21,8 +21,21 @@ Browse marks them.
 | Item | Action |
 |------|--------|
 | Capability rows | On/off · default model · browse |
+| Inline generated images | Embed base64 in the tool result (off by default) |
 | Output folder | Where images and TTS files are saved |
 | Status | Summary |
+
+### Inline generated images
+
+Off by default: `nr_image_generate` writes the file and returns its **path**.
+
+A generated image is often 1–2 MB, which is ~2.7M base64 characters (~675k tokens)
+once embedded — more than most context windows hold, and it is resent on every later
+turn. That overflows as `Upstream request failed` after the file was already written,
+and text-only chat models reject it outright.
+
+Leaving it off lets pi read and downsize the file itself when the model supports vision.
+Turn it on only with a large-context vision model.
 
 ## Tools (agent-facing)
 
