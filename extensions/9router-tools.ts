@@ -13,6 +13,11 @@
  * Speech-to-text / mic input is intentionally not included — use a dedicated
  * OS dictation app (e.g. Superwhisper, Spokenly) for voice → editor.
  *
+ * Each tool's description carries the ids available for its capability, and a
+ * `model` argument is resolved against the catalog before any request goes out,
+ * so a guessed name fails locally with the real ids rather than as an opaque
+ * upstream routing error.
+ *
  * Shared config: ~/.pi/agent/9router.json
  */
 
@@ -41,11 +46,24 @@ type CapId = "image" | "tts" | "embed" | "web_search" | "web_fetch";
 interface CatalogEntry {
 	id: string;
 	name?: string;
+	/** Bucket kind from the list endpoint (chat, image, tts, web, …) */
 	kind: string;
+	/** Precise kind from /v1/models/info (llm, webSearch, webFetch, …); set by sync */
+	detailKind?: string;
 	ownedBy?: string;
 	capabilities?: unknown;
 	params?: string[];
+	namedByServer?: boolean;
+	synthetic?: boolean;
+	note?: string;
 }
+
+/**
+ * Providers whose `model` is a free-form voice / language id rather than a
+ * published model. The catalog only carries a sample of these, so an id under
+ * one of these prefixes is accepted even when it is not listed.
+ */
+const VOICE_PROVIDER_PREFIXES = ["edge-tts", "google-tts", "el", "local-device"];
 
 interface CapState {
 	enabled: boolean;
@@ -71,7 +89,7 @@ interface CapDef {
 	blurb: string;
 }
 
-const CAPS: CapDef[] = [
+export const CAPS: CapDef[] = [
 	{
 		id: "image",
 		tool: "nr_image_generate",
@@ -100,9 +118,10 @@ const CAPS: CapDef[] = [
 		id: "web_search",
 		tool: "nr_web_search",
 		label: "Web search",
+		// detailKind comes from /v1/models/info ("webSearch"); the id suffix is the
+		// fallback for catalogs synced before enrichment existed.
 		catalogKind: (e) =>
-			e.kind === "web" &&
-			(e.id.endsWith("/search") || /search/i.test(e.id) || String((e as any).kind) === "webSearch"),
+			e.kind === "web" && (e.detailKind === "webSearch" || (!e.detailKind && /search/i.test(e.id))),
 		defaultEnabled: true,
 		blurb: "Query → results",
 	},
@@ -111,8 +130,7 @@ const CAPS: CapDef[] = [
 		tool: "nr_web_fetch",
 		label: "Web fetch",
 		catalogKind: (e) =>
-			e.kind === "web" &&
-			(e.id.endsWith("/fetch") || /fetch/i.test(e.id) || String((e as any).kind) === "webFetch"),
+			e.kind === "web" && (e.detailKind === "webFetch" || (!e.detailKind && /fetch/i.test(e.id))),
 		defaultEnabled: true,
 		blurb: "URL → markdown",
 	},
@@ -177,11 +195,162 @@ function modelsForCap(cfg: ToolsConfigSlice, cap: CapDef): CatalogEntry[] {
 	return catalog.filter((e) => e.kind === filter);
 }
 
-function resolveModel(cfg: ToolsConfigSlice, cap: CapDef, override?: string): string | null {
-	if (override?.trim()) return override.trim();
-	const state = getCapState(cfg, cap);
-	if (state.model?.trim()) return state.model.trim();
-	return modelsForCap(cfg, cap)[0]?.id || null;
+/** Lowercase and drop every separator, so "nano-banana" and "NanoBanana" collapse to the same key. */
+function normalizeId(s: string): string {
+	return s.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/** Portion of an id after the last slash: "nb/nanobanana-flash" → "nanobanana-flash". */
+function leafOf(id: string): string {
+	const i = id.lastIndexOf("/");
+	return i >= 0 ? id.slice(i + 1) : id;
+}
+
+function isVoiceProviderId(id: string): boolean {
+	const i = id.indexOf("/");
+	if (i <= 0 || i === id.length - 1) return false;
+	return VOICE_PROVIDER_PREFIXES.includes(id.slice(0, i));
+}
+
+type ModelResolution =
+	| { ok: true; id: string; note?: string }
+	| { ok: false; message: string };
+
+/**
+ * Turn whatever the caller passed for `model` into a real catalog id.
+ *
+ * Previously the override was forwarded verbatim, so a plausible-looking guess
+ * such as "nano-banana" reached 9Router, which split it on the missing slash and
+ * failed with "No credentials for provider: nano" — an error that says nothing
+ * about the actual problem. Matching against the catalog first turns that into a
+ * hit (or a list of real ids) without a round trip.
+ *
+ * Order: exact id → case-insensitive id → normalized id / leaf / name → unique
+ * normalized substring. Voice providers pass through unmatched, since the
+ * catalog only samples their voices.
+ */
+export function resolveModel(cfg: ToolsConfigSlice, cap: CapDef, override?: string): ModelResolution {
+	const models = modelsForCap(cfg, cap);
+	const want = override?.trim();
+
+	if (!want) {
+		const saved = getCapState(cfg, cap).model?.trim();
+		// A saved default can outlive the model it names (provider removed, resync).
+		// Prefer it only while it is still real, rather than sending a stale id.
+		const usable =
+			saved && (models.some((m) => m.id === saved) || isVoiceProviderId(saved)) ? saved : undefined;
+		const fallback = usable || models[0]?.id;
+		if (!fallback) {
+			return {
+				ok: false,
+				message: `No ${cap.label.toLowerCase()} model available. Run /9router → Sync models, then set a default in /9router-tools.`,
+			};
+		}
+		return {
+			ok: true,
+			id: fallback,
+			note: saved && !usable ? `default "${saved}" is no longer in the catalog — used ${fallback}` : undefined,
+		};
+	}
+
+	const exact = models.find((m) => m.id === want);
+	if (exact) return { ok: true, id: exact.id };
+
+	const ci = models.find((m) => m.id.toLowerCase() === want.toLowerCase());
+	if (ci) return { ok: true, id: ci.id, note: `matched "${want}"` };
+
+	const key = normalizeId(want);
+	if (key) {
+		const keyed = models.filter(
+			(m) =>
+				normalizeId(m.id) === key ||
+				normalizeId(leafOf(m.id)) === key ||
+				(m.name ? normalizeId(m.name) === key : false),
+		);
+		if (keyed.length === 1) {
+			return { ok: true, id: keyed[0].id, note: `resolved "${want}" → ${keyed[0].id}` };
+		}
+		if (keyed.length > 1) return { ok: false, message: ambiguous(want, keyed) };
+
+		const partial = models.filter(
+			(m) =>
+				normalizeId(m.id).includes(key) ||
+				(m.name ? normalizeId(m.name).includes(key) : false),
+		);
+		if (partial.length === 1) {
+			return { ok: true, id: partial[0].id, note: `resolved "${want}" → ${partial[0].id}` };
+		}
+		if (partial.length > 1) return { ok: false, message: ambiguous(want, partial) };
+	}
+
+	// edge-tts/<voice> and friends accept ids the catalog never lists.
+	if (isVoiceProviderId(want)) return { ok: true, id: want };
+
+	return {
+		ok: false,
+		message: [
+			`Unknown ${cap.label.toLowerCase()} model "${want}".`,
+			models.length
+				? `Available: ${models.map((m) => m.id).join(", ")}`
+				: "No models in the catalog — run /9router → Sync models.",
+			"Omit `model` to use the configured default.",
+		].join("\n"),
+	};
+}
+
+/** Max concrete ids to spell out per capability before summarising the rest. */
+const MAX_LISTED_MODELS = 14;
+
+/**
+ * Render the capability's available ids for the tool description.
+ *
+ * The agent otherwise has no view of the catalog and has to guess an id from a
+ * product name, which is how "nano-banana" gets tried instead of
+ * "nb/nanobanana-flash". Names are included because that is the bridge from what
+ * a user says to what the server accepts.
+ */
+export function describeModels(cfg: ToolsConfigSlice, cap: CapDef): string {
+	const models = modelsForCap(cfg, cap);
+	if (!models.length) return "No models synced yet — run /9router → Sync models.";
+
+	const listed = models.filter((m) => !m.synthetic);
+	const synthetic = models.filter((m) => m.synthetic);
+	const parts: string[] = [];
+
+	const head = listed.slice(0, MAX_LISTED_MODELS);
+	if (head.length) {
+		parts.push(
+			head
+				.map((m) => (m.name && m.name !== m.id ? `${m.id} (${m.name})` : m.id))
+				.join(", ") + (listed.length > head.length ? `, +${listed.length - head.length} more` : ""),
+		);
+	}
+
+	// Voice providers accept any voice id, so a pattern plus samples beats a long list.
+	const byProvider = new Map<string, string[]>();
+	for (const m of synthetic) {
+		const p = m.ownedBy || leafOf(m.id);
+		byProvider.set(p, [...(byProvider.get(p) || []), leafOf(m.id)]);
+	}
+	for (const [provider, voices] of byProvider) {
+		parts.push(
+			`${provider}/<voice> — e.g. ${voices.slice(0, 3).join(", ")} (${voices.length} listed, any ${provider} voice id works)`,
+		);
+	}
+
+	return `Available: ${parts.join("; ")}.`;
+}
+
+/** Base description + the live catalog for this capability. */
+function withModels(cfg: ToolsConfigSlice, cap: CapDef, base: string): string {
+	return `${base}\n\n${describeModels(cfg, cap)}\nPass one of these exact ids as \`model\`, or omit \`model\` to use the configured default.`;
+}
+
+function ambiguous(want: string, matches: CatalogEntry[]): string {
+	return [
+		`"${want}" matches ${matches.length} models — pass one exactly:`,
+		...matches.map((m) => `  ${m.id}${m.name && m.name !== m.id ? `  (${m.name})` : ""}`),
+	].join("\n");
 }
 
 // ── HTTP ────────────────────────────────────────────────────────
@@ -548,18 +717,21 @@ function textFromResult(result: { content?: Array<{ type: string; text?: string 
 
 // ── Tools ───────────────────────────────────────────────────────
 
-function registerImageTool(pi: ExtensionAPI) {
+function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 	const cap = CAPS.find((c) => c.id === "image")!;
 	pi.registerTool({
 		name: cap.tool,
 		label: "Image",
-		description:
-			"Generate an image through 9Router and save it to disk. Best for icons, logos, illustrations, UI mockups, and concept art. Returns the file path. Uses the default image model from /9router-tools unless you pass model.",
+		description: withModels(
+			cfg,
+			cap,
+			"Generate an image through 9Router and save it to disk. Best for icons, logos, illustrations, UI mockups, and concept art. Returns the file path.",
+		),
 		promptSnippet: "Generate an image (9Router) and save the file path",
 		promptGuidelines: [
 			"Call nr_image_generate to create images, icons, logos, illustrations, or mockups.",
 			"Write a detailed prompt (subject, style, colors, composition).",
-			"Omit model unless the user names a specific image model; optional size, quality, n, filename.",
+			"Omit model unless the user names a specific image model; when they do, use an exact id from the tool description. Optional size, quality, n, filename.",
 			"Tell the user the saved file path from the tool result.",
 		],
 		parameters: Type.Object({
@@ -574,8 +746,9 @@ function registerImageTool(pi: ExtensionAPI) {
 			const cfg = loadRaw();
 			const blocked = needCap(cfg, cap);
 			if (blocked) return toolError(blocked);
-			const model = resolveModel(cfg, cap, params.model);
-			if (!model) return toolError("No image model. Sync /9router and set a default in /9router-tools.");
+			const picked = resolveModel(cfg, cap, params.model);
+			if (!picked.ok) return toolError(picked.message, { requested: params.model });
+			const model = picked.id;
 
 			const ep = endpointOf(cfg);
 			const key = apiKeyOf(cfg);
@@ -622,9 +795,14 @@ function registerImageTool(pi: ExtensionAPI) {
 			}
 
 			if (!saved.length) return toolError("No image data returned.", { model });
-			const text = [`Generated ${saved.length} image(s) · ${model}`, `Prompt: ${params.prompt}`, ...saved.map((p) => `File: ${p}`)].join(
-				"\n",
-			);
+			const text = [
+				`Generated ${saved.length} image(s) · ${model}`,
+				picked.note ? `Model ${picked.note}` : "",
+				`Prompt: ${params.prompt}`,
+				...saved.map((p) => `File: ${p}`),
+			]
+				.filter(Boolean)
+				.join("\n");
 
 			const content: Array<
 				| { type: "text"; text: string }
@@ -658,13 +836,16 @@ function registerImageTool(pi: ExtensionAPI) {
 	});
 }
 
-function registerTtsTool(pi: ExtensionAPI) {
+function registerTtsTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 	const cap = CAPS.find((c) => c.id === "tts")!;
 	pi.registerTool({
 		name: cap.tool,
 		label: "Speech",
-		description:
-			"Convert text to speech through 9Router and save an audio file. Use for narration or voiceover. Uses the default TTS model from /9router-tools unless you pass model.",
+		description: withModels(
+			cfg,
+			cap,
+			"Convert text to speech through 9Router and save an audio file. Use for narration or voiceover.",
+		),
 		promptSnippet: "Text-to-speech (9Router) — saves an audio file",
 		promptGuidelines: [
 			"Call nr_tts to turn text into spoken audio (narration, voiceover, read-aloud).",
@@ -680,8 +861,9 @@ function registerTtsTool(pi: ExtensionAPI) {
 			const cfg = loadRaw();
 			const blocked = needCap(cfg, cap);
 			if (blocked) return toolError(blocked);
-			const model = resolveModel(cfg, cap, params.model);
-			if (!model) return toolError("No TTS model. Sync /9router and set a default in /9router-tools.");
+			const picked = resolveModel(cfg, cap, params.model);
+			if (!picked.ok) return toolError(picked.message, { requested: params.model });
+			const model = picked.id;
 			onUpdate?.({ content: [{ type: "text", text: `Synthesizing · ${model}` }] });
 
 			const ep = endpointOf(cfg);
@@ -702,11 +884,18 @@ function registerTtsTool(pi: ExtensionAPI) {
 			if (!bytes?.length) return toolError("Empty audio.", { model });
 			const name = params.filename?.replace(/[^\w.\-]+/g, "_") || `tts-${stamp()}-${slug(params.input)}${ext}`;
 			const path = writeBytes(outDir, name, bytes);
-			return toolOk(`Speech saved.\nModel: ${model}\nFile: ${path}\nChars: ${params.input.length}`, {
-				model,
-				file: path,
-				bytes: bytes.length,
-			});
+			return toolOk(
+				[
+					"Speech saved.",
+					`Model: ${model}`,
+					picked.note ? `Model ${picked.note}` : "",
+					`File: ${path}`,
+					`Chars: ${params.input.length}`,
+				]
+					.filter(Boolean)
+					.join("\n"),
+				{ model, file: path, bytes: bytes.length },
+			);
 		},
 		renderResult(result, { expanded }, theme) {
 			const d = (result.details || {}) as { file?: string };
@@ -715,13 +904,16 @@ function registerTtsTool(pi: ExtensionAPI) {
 	});
 }
 
-function registerEmbedTool(pi: ExtensionAPI) {
+function registerEmbedTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 	const cap = CAPS.find((c) => c.id === "embed")!;
 	pi.registerTool({
 		name: cap.tool,
 		label: "Embed",
-		description:
+		description: withModels(
+			cfg,
+			cap,
 			"Create text embeddings through 9Router for RAG or similarity. Returns dimensions and a short preview by default. Set full=true only when full vector arrays are required.",
+		),
 		promptSnippet: "Create text embeddings (9Router)",
 		promptGuidelines: [
 			"Call nr_embed for embeddings, vectors, similarity, or RAG chunk encoding.",
@@ -738,8 +930,9 @@ function registerEmbedTool(pi: ExtensionAPI) {
 			const cfg = loadRaw();
 			const blocked = needCap(cfg, cap);
 			if (blocked) return toolError(blocked);
-			const model = resolveModel(cfg, cap, params.model);
-			if (!model) return toolError("No embedding model. Sync /9router and set a default in /9router-tools.");
+			const picked = resolveModel(cfg, cap, params.model);
+			if (!picked.ok) return toolError(picked.message, { requested: params.model });
+			const model = picked.id;
 			const parts = params.input.includes("\n---\n")
 				? params.input
 						.split("\n---\n")
@@ -779,13 +972,16 @@ function registerEmbedTool(pi: ExtensionAPI) {
 	});
 }
 
-function registerWebSearchTool(pi: ExtensionAPI) {
+function registerWebSearchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 	const cap = CAPS.find((c) => c.id === "web_search")!;
 	pi.registerTool({
 		name: cap.tool,
 		label: "Search",
-		description:
-			"Search the web through 9Router. Returns titles, URLs, and snippets. For full page text of a known URL, use nr_web_fetch. Uses the default search model from /9router-tools unless you pass model.",
+		description: withModels(
+			cfg,
+			cap,
+			"Search the web through 9Router. Returns titles, URLs, and snippets. For full page text of a known URL, use nr_web_fetch.",
+		),
 		promptSnippet: "Search the web (9Router)",
 		promptGuidelines: [
 			"Call nr_web_search for current web info, docs, news, or sources.",
@@ -806,8 +1002,9 @@ function registerWebSearchTool(pi: ExtensionAPI) {
 			const cfg = loadRaw();
 			const blocked = needCap(cfg, cap);
 			if (blocked) return toolError(blocked);
-			const model = resolveModel(cfg, cap, params.model);
-			if (!model) return toolError("No web search model. Sync /9router and set a default in /9router-tools.");
+			const picked = resolveModel(cfg, cap, params.model);
+			if (!picked.ok) return toolError(picked.message, { requested: params.model });
+			const model = picked.id;
 			onUpdate?.({ content: [{ type: "text", text: `Searching · ${model}` }] });
 			const body: Record<string, unknown> = {
 				model,
@@ -857,13 +1054,16 @@ function registerWebSearchTool(pi: ExtensionAPI) {
 	});
 }
 
-function registerWebFetchTool(pi: ExtensionAPI) {
+function registerWebFetchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 	const cap = CAPS.find((c) => c.id === "web_fetch")!;
 	pi.registerTool({
 		name: cap.tool,
 		label: "Fetch",
-		description:
+		description: withModels(
+			cfg,
+			cap,
 			"Fetch a URL as markdown, text, or HTML through 9Router. Use when you already have a URL. For discovery, use nr_web_search first.",
+		),
 		promptSnippet: "Fetch a URL as markdown (9Router)",
 		promptGuidelines: [
 			"Call nr_web_fetch for absolute http(s) URLs when you need page content.",
@@ -881,8 +1081,9 @@ function registerWebFetchTool(pi: ExtensionAPI) {
 			const cfg = loadRaw();
 			const blocked = needCap(cfg, cap);
 			if (blocked) return toolError(blocked);
-			const model = resolveModel(cfg, cap, params.model);
-			if (!model) return toolError("No web fetch model. Sync /9router and set a default in /9router-tools.");
+			const picked = resolveModel(cfg, cap, params.model);
+			if (!picked.ok) return toolError(picked.message, { requested: params.model });
+			const model = picked.id;
 			if (!/^https?:\/\//i.test(params.url)) return toolError("url must be absolute http(s)");
 			onUpdate?.({ content: [{ type: "text", text: `Fetching · ${params.url}` }] });
 			const body: Record<string, unknown> = {
@@ -927,11 +1128,19 @@ function registerWebFetchTool(pi: ExtensionAPI) {
 // ── Entry ───────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-	registerImageTool(pi);
-	registerTtsTool(pi);
-	registerEmbedTool(pi);
-	registerWebSearchTool(pi);
-	registerWebFetchTool(pi);
+	/**
+	 * Descriptions embed the current catalog, so re-register after every sync.
+	 * registerTool keys on tool name, so this replaces the previous definition.
+	 */
+	const registerAll = (cfg: ToolsConfigSlice) => {
+		registerImageTool(pi, cfg);
+		registerTtsTool(pi, cfg);
+		registerEmbedTool(pi, cfg);
+		registerWebSearchTool(pi, cfg);
+		registerWebFetchTool(pi, cfg);
+	};
+
+	registerAll(loadRaw());
 
 	const applyFromDisk = () => applyToolActivation(pi, loadRaw());
 
@@ -948,7 +1157,11 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.events.on("9router:synced", () => applyFromDisk());
+	// A sync changes which models exist, so rebuild the descriptions from the new catalog.
+	pi.events.on("9router:synced", () => {
+		registerAll(loadRaw());
+		applyFromDisk();
+	});
 
 	pi.registerCommand("9router-tools", {
 		description: "9Router tools — enable image, speech, search, fetch; set defaults",

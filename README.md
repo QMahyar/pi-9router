@@ -50,6 +50,23 @@ Requires a running [9Router](https://9router.com) instance (`npm i -g 9router` �
 
 **Off tools leave the model context.** Only enabled tools expose schema + usage guidelines to the agent.
 
+## Model names
+
+Sync pulls real metadata per model from `/v1/models/info`, because the list endpoints
+return only `{ id, owned_by }`. Without it a display name is a guess derived from the
+id — `openrouter/openai/tts-1-hd` reads as *"Openai/Tts 1 Hd"* instead of **TTS-1 HD**.
+
+Each tool's description also carries the ids available for its capability, and a
+`model` argument is matched against the catalog before any request leaves pi. A
+guess like `nano-banana` resolves to the right id, or fails with the real
+candidates listed — instead of reaching 9Router and coming back as
+`No credentials for provider: nano`.
+
+**edge-tts** and **google-tts** are free, keyless, and absent from `/v1/models/tts`
+(their `model` is a voice or language code, not a published model). Sync probes each
+with a short synthesis call and adds them only when they respond, so a blocked
+egress or proxy leaves them out rather than listing models that always fail.
+
 ## 60-second start
 
 ```text

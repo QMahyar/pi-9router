@@ -9,6 +9,14 @@
  * (and for /9router-tools). Only chat (LLM) models are registered with pi's model picker.
  * STT catalog may still appear under Browse; this package does not expose STT tools.
  *
+ * The list endpoints return only { id, object, owned_by }, so every model is then
+ * looked up via GET /v1/models/info?id= for its real name, precise kind, endpoint,
+ * and accepted params. Without that pass, display names are guesses derived from
+ * the id ("TTS-1 HD" shows up as "Openai/Tts 1 Hd").
+ *
+ * edge-tts / google-tts are noAuth voice providers with no list-endpoint entry;
+ * they are probed with a short synthesis call and only added when they respond.
+ *
  * Config: ~/.pi/agent/9router.json
  * Env:    NINEROUTER_URL, NINEROUTER_KEY
  */
@@ -38,6 +46,62 @@ const CATALOG_KINDS = [
 ] as const;
 
 type CatalogKind = (typeof CATALOG_KINDS)[number];
+
+/** Concurrency for the per-model /v1/models/info enrichment pass */
+const INFO_CONCURRENCY = 8;
+
+/**
+ * Voice-based TTS providers 9Router routes without credentials (noAuth).
+ *
+ * They are absent from /v1/models/tts because the `model` field is a *voice*
+ * (edge-tts) or a *language code* (google-tts) rather than a published model id,
+ * so there is no list endpoint entry to enumerate. /v1/audio/voices can list
+ * edge-tts voices but requires a real dashboard key (401 with a dummy one), so
+ * we enumerate when that works and fall back to this verified set otherwise.
+ *
+ * Each provider is probed with a tiny synthesis call during sync and only enters
+ * the catalog when that probe returns real audio — a proxy or blocked egress
+ * makes these 502, and silently listing dead models is worse than omitting them.
+ */
+const VOICE_TTS_PROVIDERS: Array<{
+	provider: string;
+	/** Voice/language ids verified against /v1/audio/speech */
+	voices: string[];
+	/** Representative id used for the liveness probe */
+	probe: string;
+	/** true when /v1/audio/voices can enumerate this provider */
+	enumerable: boolean;
+	note: string;
+}> = [
+	{
+		provider: "edge-tts",
+		voices: [
+			"en-US-AriaNeural",
+			"en-US-GuyNeural",
+			"en-US-JennyNeural",
+			"en-GB-SoniaNeural",
+			"en-GB-RyanNeural",
+			"en-AU-NatashaNeural",
+			"de-DE-KatjaNeural",
+			"fr-FR-DeniseNeural",
+			"es-ES-ElviraNeural",
+			"fa-IR-DilaraNeural",
+			"vi-VN-HoaiMyNeural",
+		],
+		probe: "en-US-AriaNeural",
+		enumerable: true,
+		note: "Any edge-tts voice id works, not only the listed ones",
+	},
+	{
+		provider: "google-tts",
+		// Plain 2-letter codes only: region-qualified codes (en-GB) and some
+		// languages (fa) 502 upstream.
+		voices: ["en", "de", "fr", "es", "vi", "ja", "ar", "hi"],
+		probe: "en",
+		enumerable: false,
+		note: "model is a 2-letter language code",
+	},
+];
 
 // ── Types ───────────────────────────────────────────────────────
 
@@ -76,11 +140,23 @@ interface RemoteModel {
 interface CatalogEntry {
 	id: string;
 	name: string;
+	/** Bucket kind from the list endpoint (chat, image, tts, web, …) — used for grouping */
 	kind: CatalogKind | string;
+	/**
+	 * Precise kind reported by /v1/models/info (llm, webSearch, webFetch, tts, …).
+	 * The list endpoints do not return this, so it is only set after enrichment.
+	 */
+	detailKind?: string;
 	ownedBy?: string;
 	endpoint?: string;
 	capabilities?: ModelCapabilities | string[];
 	params?: string[];
+	/** true when `name` came from the server rather than being derived from the id */
+	namedByServer?: boolean;
+	/** Locally added (voice-based TTS providers that have no list-endpoint entry) */
+	synthetic?: boolean;
+	/** Free-form note shown in Browse for synthetic entries */
+	note?: string;
 	/** Only set for chat models mapped into pi */
 	registered?: boolean;
 	contextWindow?: number;
@@ -420,8 +496,183 @@ async function fetchModelInfo(
 ): Promise<RemoteModel | null> {
 	const url = `${baseV1(endpoint)}/models/info?id=${encodeURIComponent(id)}`;
 	const res = await httpGetJson<RemoteModel>(url, apiKey, signal);
+	// Not every id has an info record (combos, some upstream passthroughs 404).
 	if (!res.ok) return null;
+	if (!res.data || typeof res.data !== "object" || (res.data as any).error) return null;
 	return res.data;
+}
+
+/** Run `task` over `items` with a fixed concurrency, aborting between batches. */
+async function mapConcurrent<T, R>(
+	items: T[],
+	limit: number,
+	task: (item: T) => Promise<R>,
+	signal?: AbortSignal,
+): Promise<void> {
+	for (let i = 0; i < items.length; i += limit) {
+		if (signal?.aborted) return;
+		await Promise.all(items.slice(i, i + limit).map(task));
+	}
+}
+
+/**
+ * Fill in per-model metadata the list endpoints omit.
+ *
+ * GET /v1/models[/kind] returns only { id, object, owned_by }, so a display name
+ * derived from the id is a guess — "nb/nanobanana-flash" becomes "Nanobanana Flash"
+ * when the server calls it "NanoBanana Flash", and "openrouter/openai/tts-1-hd"
+ * becomes "Openai/Tts 1 Hd" instead of "TTS-1 HD". GET /v1/models/info?id= returns
+ * the real name plus the precise kind, endpoint, and accepted params. This pass asks
+ * for every model in the catalog; ids without an info record keep the derived name.
+ */
+async function enrichCatalog(
+	endpoint: string,
+	apiKey: string,
+	catalog: CatalogEntry[],
+	opts: { signal?: AbortSignal; onProgress?: (msg: string) => void } = {},
+): Promise<{ named: number; missing: number; infoById: Map<string, RemoteModel> }> {
+	const infoById = new Map<string, RemoteModel>();
+	let named = 0;
+	let missing = 0;
+
+	opts.onProgress?.(`Fetching metadata for ${catalog.length} models…`);
+	await mapConcurrent(
+		catalog,
+		INFO_CONCURRENCY,
+		async (entry) => {
+			const info = await fetchModelInfo(endpoint, apiKey, entry.id, opts.signal);
+			if (!info) {
+				missing++;
+				return;
+			}
+			infoById.set(entry.id, info);
+			if (info.name?.trim()) {
+				entry.name = info.name.trim();
+				entry.namedByServer = true;
+				named++;
+			}
+			if (info.kind?.trim()) entry.detailKind = info.kind.trim();
+			if (info.endpoint?.trim()) entry.endpoint = info.endpoint.trim();
+			if (Array.isArray(info.params) && info.params.length) entry.params = info.params;
+			const caps = asCaps(info.capabilities);
+			if (caps) {
+				entry.capabilities = { ...(asCaps(entry.capabilities) || {}), ...caps };
+				if (caps.contextWindow) entry.contextWindow = caps.contextWindow;
+				if (caps.maxOutput) entry.maxTokens = caps.maxOutput;
+				if (caps.vision) entry.input = ["text", "image"];
+			}
+		},
+		opts.signal,
+	);
+
+	return { named, missing, infoById };
+}
+
+// ── Voice-based TTS providers (edge-tts / google-tts) ───────────
+
+/** POST a 1-word synthesis and report whether real audio came back. */
+async function probeSpeech(
+	endpoint: string,
+	apiKey: string,
+	model: string,
+	signal?: AbortSignal,
+): Promise<{ ok: boolean; error?: string }> {
+	try {
+		const res = await fetch(`${baseV1(endpoint)}/audio/speech`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Accept: "*/*",
+				...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+			},
+			body: JSON.stringify({ model, input: "ok" }),
+			signal,
+		});
+		if (!res.ok) {
+			const body = (await res.text()).slice(0, 160);
+			return { ok: false, error: `HTTP ${res.status} ${body}` };
+		}
+		const bytes = await res.arrayBuffer();
+		// A JSON error body is far smaller than any real clip.
+		if (bytes.byteLength < 512) return { ok: false, error: `only ${bytes.byteLength} bytes` };
+		return { ok: true };
+	} catch (err: any) {
+		if (err?.name === "AbortError") return { ok: false, error: "aborted" };
+		return { ok: false, error: err?.message || String(err) };
+	}
+}
+
+/** Try to enumerate a provider's voices; returns null when the endpoint is unavailable. */
+async function fetchVoices(
+	endpoint: string,
+	apiKey: string,
+	provider: string,
+	signal?: AbortSignal,
+): Promise<string[] | null> {
+	const url = `${baseV1(endpoint)}/audio/voices?provider=${encodeURIComponent(provider)}`;
+	const res = await httpGetJson<{ data?: Array<{ model?: string; id?: string; name?: string }> }>(
+		url,
+		apiKey,
+		signal,
+	);
+	if (!res.ok) return null;
+	const rows = Array.isArray(res.data?.data) ? res.data.data : [];
+	const ids = rows
+		.map((v) => (v.model || v.id || v.name || "").trim())
+		.filter(Boolean)
+		// The endpoint may return either bare voice ids or already-prefixed ones.
+		.map((v) => (v.startsWith(`${provider}/`) ? v.slice(provider.length + 1) : v));
+	return ids.length ? ids : null;
+}
+
+/**
+ * Probe each noAuth voice provider and return catalog entries for the live ones.
+ *
+ * These have no /v1/models/tts entry to discover, so without this they are
+ * invisible to /9router-tools and to the agent even though they work and are free.
+ */
+async function discoverVoiceTts(
+	endpoint: string,
+	apiKey: string,
+	opts: { signal?: AbortSignal; onProgress?: (msg: string) => void } = {},
+): Promise<{ entries: CatalogEntry[]; skipped: string[] }> {
+	const entries: CatalogEntry[] = [];
+	const skipped: string[] = [];
+
+	await Promise.all(
+		VOICE_TTS_PROVIDERS.map(async (p) => {
+			opts.onProgress?.(`Probing ${p.provider}…`);
+			const probe = await probeSpeech(endpoint, apiKey, `${p.provider}/${p.probe}`, opts.signal);
+			if (!probe.ok) {
+				skipped.push(`${p.provider} (${probe.error})`);
+				return;
+			}
+
+			let voices = p.voices;
+			if (p.enumerable) {
+				const listed = await fetchVoices(endpoint, apiKey, p.provider, opts.signal);
+				if (listed?.length) voices = listed;
+			}
+
+			for (const voice of voices) {
+				entries.push({
+					id: `${p.provider}/${voice}`,
+					name: `${voice} (${p.provider})`,
+					kind: "tts",
+					detailKind: "tts",
+					ownedBy: p.provider,
+					endpoint: "/v1/audio/speech",
+					params: ["input"],
+					namedByServer: false,
+					synthetic: true,
+					note: p.note,
+				});
+			}
+		}),
+	);
+
+	entries.sort((a, b) => a.id.localeCompare(b.id));
+	return { entries, skipped };
 }
 
 export interface SyncResult {
@@ -431,9 +682,16 @@ export interface SyncResult {
 	chatModels: PiModelDef[];
 	catalog: CatalogEntry[];
 	healthOk: boolean;
+	/** How many display names came from the server vs were derived from the id */
+	namedByServer?: number;
+	namesDerived?: number;
+	/** Voice TTS providers that failed their liveness probe, with the reason */
+	voiceSkipped?: string[];
+	/** Voice TTS entries added to the catalog */
+	voiceAdded?: number;
 }
 
-async function fetchAllAndBuild(
+export async function fetchAllAndBuild(
 	config: Config,
 	opts: {
 		signal?: AbortSignal;
@@ -512,39 +770,53 @@ async function fetchAllAndBuild(
 		};
 	}
 
-	// Map chat → pi models. List already carries rich capabilities for most.
-	// Optionally enrich sparse entries via /v1/models/info (combos often lack caps).
-	opts.onProgress?.(`Mapping ${chatRemotes.length} chat models…`);
-	const sparse = chatRemotes.filter((m) => !asCaps(m.capabilities)?.contextWindow);
-	const infoMap = new Map<string, RemoteModel>();
-
-	if (opts.enrichChatInfo !== false && sparse.length > 0 && sparse.length <= 40) {
-		opts.onProgress?.(`Enriching ${sparse.length} models via /v1/models/info…`);
-		const conc = 6;
-		for (let i = 0; i < sparse.length; i += conc) {
-			if (opts.signal?.aborted) break;
-			const batch = sparse.slice(i, i + conc);
-			await Promise.all(
-				batch.map(async (m) => {
-					const info = await fetchModelInfo(endpoint, apiKey, m.id, opts.signal);
-					if (info) infoMap.set(m.id, info);
-				}),
-			);
-		}
+	// Ask the server for real names / kinds / endpoints / params. The list
+	// endpoints omit all of it, so skipping this leaves every display name a guess.
+	let infoById = new Map<string, RemoteModel>();
+	let namedByServer = 0;
+	if (opts.enrichChatInfo !== false) {
+		const enriched = await enrichCatalog(endpoint, apiKey, catalog, {
+			signal: opts.signal,
+			onProgress: opts.onProgress,
+		});
+		infoById = enriched.infoById;
+		namedByServer = enriched.named;
 	}
 
+	// Voice-based noAuth TTS providers have no list entry — probe and add the live ones.
+	const voice = await discoverVoiceTts(endpoint, apiKey, {
+		signal: opts.signal,
+		onProgress: opts.onProgress,
+	});
+	if (voice.entries.length) {
+		const known = new Set(catalog.map((c) => c.id));
+		const fresh = voice.entries.filter((e) => !known.has(e.id));
+		catalog.push(...fresh);
+		counts.tts = (counts.tts || 0) + fresh.length;
+	}
+
+	// Map chat → pi models, reusing the info records already fetched above.
+	opts.onProgress?.(`Mapping ${chatRemotes.length} chat models…`);
 	for (const m of chatRemotes) {
-		const def = toPiModel(m, infoMap.get(m.id));
+		const def = toPiModel(m, infoById.get(m.id));
 		chatModels.push(def);
 		const entry = catalog.find((c) => c.id === m.id && c.kind === "chat");
 		if (entry) {
 			entry.registered = true;
-			entry.name = def.name;
+			// The catalog name is already the server's when enrichment found one;
+			// only fall back to the derived name when it is not.
+			if (!entry.namedByServer) entry.name = def.name;
 			entry.contextWindow = def.contextWindow;
 			entry.maxTokens = def.maxTokens;
 			entry.reasoning = def.reasoning;
 			entry.input = def.input;
 		}
+	}
+
+	// Keep pi's model picker in step with the server's naming.
+	for (const def of chatModels) {
+		const entry = catalog.find((c) => c.id === def.id && c.kind === "chat");
+		if (entry?.namedByServer) def.name = entry.name;
 	}
 
 	return {
@@ -554,6 +826,10 @@ async function fetchAllAndBuild(
 		chatModels,
 		catalog,
 		healthOk: true,
+		namedByServer,
+		namesDerived: catalog.filter((c) => !c.namedByServer && !c.synthetic).length,
+		voiceSkipped: voice.skipped,
+		voiceAdded: voice.entries.length,
 	};
 }
 
@@ -652,6 +928,8 @@ async function browseCatalog(ui: ExtensionContext["ui"], config: Config): Promis
 			const slice = entries.slice(page * pageSize, page * pageSize + pageSize);
 			const items = slice.map((e) => {
 				const bits: string[] = [e.id];
+				// Names are the server's after enrichment, so worth showing inline.
+				if (e.namedByServer && e.name && e.name !== e.id) bits.push(e.name);
 				if (e.reasoning) bits.push("🧠");
 				if (e.input?.includes("image")) bits.push("👁");
 				if (e.contextWindow) bits.push(`${Math.round(e.contextWindow / 1000)}k`);
@@ -682,8 +960,9 @@ async function browseCatalog(ui: ExtensionContext["ui"], config: Config): Promis
 
 			const detail = [
 				`id: ${entry.id}`,
-				`name: ${entry.name}`,
-				`kind: ${entry.kind}`,
+				`name: ${entry.name}${entry.namedByServer ? "" : " (derived from id — server has no name)"}`,
+				`kind: ${entry.kind}${entry.detailKind && entry.detailKind !== entry.kind ? ` (server: ${entry.detailKind})` : ""}`,
+				entry.synthetic ? `source: added locally${entry.note ? ` — ${entry.note}` : ""}` : "",
 				entry.ownedBy ? `owned_by: ${entry.ownedBy}` : "",
 				entry.endpoint ? `endpoint: ${entry.endpoint}` : "",
 				entry.contextWindow ? `contextWindow: ${entry.contextWindow}` : "",
@@ -819,6 +1098,10 @@ async function runNineRouterUI(pi: ExtensionAPI, ctx: ExtensionContext): Promise
 			const summary = [
 				`Registered ${sync.chatModels.length} chat models (provider ${PROVIDER_ID})`,
 				...Object.entries(sync.counts).map(([k, n]) => `  ${k}: ${n}`),
+				"",
+				`Names from server: ${sync.namedByServer ?? 0} · derived from id: ${sync.namesDerived ?? 0}`,
+				sync.voiceAdded ? `Voice TTS added: ${sync.voiceAdded} (edge-tts / google-tts)` : "",
+				sync.voiceSkipped?.length ? `Voice TTS unavailable: ${sync.voiceSkipped.join(", ")}` : "",
 				sync.error ? `Note: ${sync.error}` : "",
 				"",
 				"Next: /model → provider 9router",
