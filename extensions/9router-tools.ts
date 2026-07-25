@@ -567,29 +567,65 @@ async function transcribeFile(
 
 // ── Mic recording ───────────────────────────────────────────────
 
+/**
+ * List Windows DirectShow audio capture devices via ffmpeg.
+ * ffmpeg always exits non-zero for -list_devices; names are on stderr.
+ */
 function listWindowsAudioDevices(ffmpegPath: string): string[] {
+	let text = "";
 	try {
-		const out = execFileSync(
+		execFileSync(
 			ffmpegPath,
 			["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
 			{ encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
 		);
-		// ffmpeg prints devices to stderr; execFileSync throws — catch below
-		void out;
 	} catch (err: any) {
-		const text = String(err?.stderr || err?.message || err);
-		const names: string[] = [];
-		const re = /"([^"]+)"\s*\(audio\)/gi;
-		let m: RegExpExecArray | null;
-		while ((m = re.exec(text))) names.push(m[1]);
-		// alternate format: DirectShow audio devices ... "Mic Name"
-		const re2 = /\[dshow[^\]]*\]\s*"([^"]+)"/gi;
-		while ((m = re2.exec(text))) {
-			if (!names.includes(m[1])) names.push(m[1]);
-		}
-		return names;
+		const stderr = err?.stderr;
+		text = Buffer.isBuffer(stderr)
+			? stderr.toString("utf8")
+			: String(stderr || err?.message || err);
 	}
-	return [];
+
+	const names: string[] = [];
+	const seen = new Set<string>();
+
+	// Primary:  "Microphone Name" (audio)
+	const reAudio = /"([^"]+)"\s*\(audio\)/gi;
+	let m: RegExpExecArray | null;
+	while ((m = reAudio.exec(text))) {
+		const n = m[1].trim();
+		if (n && !seen.has(n.toLowerCase())) {
+			seen.add(n.toLowerCase());
+			names.push(n);
+		}
+	}
+
+	// Fallback: parse the "DirectShow audio devices" section only
+	if (!names.length) {
+		const audioSection = text.split(/DirectShow\s+audio\s+devices/i)[1] || "";
+		const beforeVideo = audioSection.split(/DirectShow\s+video\s+devices/i)[0] || audioSection;
+		const reQuoted = /"([^"]+)"/g;
+		while ((m = reQuoted.exec(beforeVideo))) {
+			const n = m[1].trim();
+			if (n && !seen.has(n.toLowerCase()) && !/^dummy$/i.test(n)) {
+				seen.add(n.toLowerCase());
+				names.push(n);
+			}
+		}
+	}
+
+	return names;
+}
+
+/**
+ * dshow input for spawn argv (not shell):
+ *   audio=Microphone (Realtek(R) Audio)
+ * Pass as ONE array element so spaces are fine. Do NOT wrap in extra quotes —
+ * ffmpeg would look for a device name that includes the quote characters.
+ */
+function dshowAudioInput(deviceName: string): string {
+	const cleaned = deviceName.replace(/"/g, "").trim();
+	return `audio=${cleaned}`;
 }
 
 function recordMicrophone(opts: {
@@ -604,9 +640,28 @@ function recordMicrophone(opts: {
 		const args: string[] = ["-y", "-hide_banner", "-loglevel", "error"];
 
 		if (process.platform === "win32") {
-			const dev = device || "default";
-			// dshow: audio="Device Name" — "default" often fails; caller should set device
-			args.push("-f", "dshow", "-i", `audio=${dev}`, "-t", String(seconds), "-ac", "1", "-ar", "16000", outPath);
+			if (!device || !device.trim() || /^default$/i.test(device)) {
+				resolvePromise({
+					ok: false,
+					error:
+						'No microphone selected. Open /9router-tools → Voice input → pick a mic (Windows has no "default" dshow device).',
+				});
+				return;
+			}
+			// Critical: quotes around the device name for dshow
+			args.push(
+				"-f",
+				"dshow",
+				"-i",
+				dshowAudioInput(device),
+				"-t",
+				String(seconds),
+				"-ac",
+				"1",
+				"-ar",
+				"16000",
+				outPath,
+			);
 		} else if (process.platform === "darwin") {
 			args.push("-f", "avfoundation", "-i", ":0", "-t", String(seconds), "-ac", "1", "-ar", "16000", outPath);
 		} else {
@@ -623,13 +678,50 @@ function recordMicrophone(opts: {
 			if (code === 0 && existsSync(outPath) && statSync(outPath).size > 100) {
 				resolvePromise({ ok: true });
 			} else {
-				resolvePromise({
-					ok: false,
-					error: err.trim() || `ffmpeg exited ${code}. Pick an audio device in /9router-tools → Voice input.`,
-				});
+				const hint =
+					process.platform === "win32"
+						? " Pick the correct mic in /9router-tools → Voice input."
+						: "";
+				const msg = (err.trim() || `ffmpeg exited ${code}.`) + hint;
+				resolvePromise({ ok: false, error: msg.slice(0, 400) });
 			}
 		});
 	});
+}
+
+async function ensureWindowsMic(
+	ui: ExtensionContext["ui"],
+	cfg: ToolsConfigSlice,
+	ffmpegPath: string,
+	forcePick = false,
+): Promise<string | null> {
+	const devices = listWindowsAudioDevices(ffmpegPath);
+	if (!devices.length) {
+		ui.notify(
+			"No DirectShow audio devices found. Check Windows mic permissions and that ffmpeg can see devices.",
+			"error",
+		);
+		return null;
+	}
+
+	const saved = cfg.voice?.device?.trim();
+	const savedOk = saved && devices.some((d) => d === saved);
+
+	if (!forcePick && savedOk) return saved!;
+
+	if (!forcePick && devices.length === 1) {
+		saveRaw({ voice: { device: devices[0] } });
+		return devices[0];
+	}
+
+	const items = devices.map((d) => (d === saved ? `* ${d}` : `  ${d}`));
+	items.push("Cancel");
+	const pick = await ui.select("Microphone for voice input", items);
+	if (!pick || pick === "Cancel") return null;
+	const name = pick.replace(/^\*\s/, "").replace(/^\s\s/, "").trim();
+	if (!name || !devices.includes(name)) return null;
+	saveRaw({ voice: { device: name } });
+	return name;
 }
 
 async function runVoiceToEditor(ctx: ExtensionContext): Promise<void> {
@@ -644,7 +736,7 @@ async function runVoiceToEditor(ctx: ExtensionContext): Promise<void> {
 	const ff = resolveFfmpeg(cfg);
 	if (!ff.path) {
 		ui.notify(
-			"ffmpeg not found. Install system ffmpeg (winget install ffmpeg) or reinstall this package (bundles ffmpeg-static).",
+			"ffmpeg not found. Install system ffmpeg (winget install Gyan.FFmpeg) or reinstall this package (bundles ffmpeg-static).",
 			"error",
 		);
 		return;
@@ -652,20 +744,12 @@ async function runVoiceToEditor(ctx: ExtensionContext): Promise<void> {
 
 	const vs = voiceSettings(cfg);
 	let device = vs.device;
-	if (process.platform === "win32" && !device) {
-		const devices = listWindowsAudioDevices(ff.path);
-		if (devices.length === 1) {
-			device = devices[0];
-			saveRaw({ voice: { device } });
-		} else if (devices.length > 1) {
-			const pick = await ui.select("Microphone for voice input", [...devices, "Cancel"]);
-			if (!pick || pick === "Cancel") return;
-			device = pick;
-			saveRaw({ voice: { device } });
-		} else {
-			// try literal default
-			device = "default";
-		}
+
+	if (process.platform === "win32") {
+		// Never use "default" — dshow requires the exact device name
+		const mic = await ensureWindowsMic(ui, cfg, ff.path, false);
+		if (!mic) return;
+		device = mic;
 	}
 
 	const outPath = join(outputDirOf(cfg), `voice-${stamp()}.wav`);
@@ -677,7 +761,16 @@ async function runVoiceToEditor(ctx: ExtensionContext): Promise<void> {
 		outPath,
 	});
 	if (!rec.ok) {
-		ui.notify(rec.error, "error");
+		// If device vanished, force re-pick next time
+		if (process.platform === "win32" && /Could not find audio/i.test(rec.error)) {
+			const cur = loadRaw();
+			const voice = { ...(cur.voice || {}) };
+			delete voice.device;
+			writeFileSync(CONFIG_PATH, JSON.stringify({ ...cur, voice }, null, 2));
+			ui.notify(`${rec.error} Device cleared — press Ctrl+Shift+V again to pick a mic.`, "error");
+		} else {
+			ui.notify(rec.error, "error");
+		}
 		return;
 	}
 
@@ -850,25 +943,9 @@ async function configureVoice(
 				ui.notify("Device picker is for Windows dshow. macOS/Linux use system default.", "info");
 				continue;
 			}
-			const devices = listWindowsAudioDevices(ff2.path);
-			if (!devices.length) {
-				ui.notify("No dshow audio devices found", "warning");
-				continue;
-			}
-			const pick = await ui.select("Microphone", [...devices, "Clear", "Back"]);
-			if (!pick || pick === "Back") continue;
-			if (pick === "Clear") {
-				const cur = loadRaw();
-				const voice = { ...(cur.voice || {}) };
-				delete voice.device;
-				const dir = dirname(CONFIG_PATH);
-				if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-				const next = { ...cur, voice };
-				writeFileSync(CONFIG_PATH, JSON.stringify(next, null, 2));
-				cfg = next;
-			} else {
-				cfg = saveRaw({ voice: { device: pick } });
-			}
+			const mic = await ensureWindowsMic(ctx, cfg, ff2.path, true);
+			cfg = loadRaw();
+			if (mic) ui.notify(`Microphone: ${mic}`, "info");
 			continue;
 		}
 
