@@ -874,7 +874,7 @@ export default async function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("9router", {
-		description: "Manage 9Router endpoint, API key, and sync models into pi",
+		description: "9Router — connect, sync models, register chat providers in pi",
 		handler: async (_args, ctx) => {
 			if (!ctx.hasUI && ctx.mode !== "tui") {
 				ctx.ui.notify("/9router needs interactive mode", "error");

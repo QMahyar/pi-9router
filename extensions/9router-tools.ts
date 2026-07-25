@@ -552,23 +552,23 @@ function registerImageTool(pi: ExtensionAPI) {
 	const cap = CAPS.find((c) => c.id === "image")!;
 	pi.registerTool({
 		name: cap.tool,
-		label: cap.label,
+		label: "Image",
 		description:
-			"Generate an image with 9Router and save it to disk. Use for icons, logos, illustrations, UI mockups, diagrams-as-images, and concept art. Returns the file path (and may include the image inline). Default model is configured in /9router-tools; only pass model to override.",
-		promptSnippet: "Generate images via 9Router (saves file path)",
+			"Generate an image through 9Router and save it to disk. Best for icons, logos, illustrations, UI mockups, and concept art. Returns the file path. Uses the default image model from /9router-tools unless you pass model.",
+		promptSnippet: "Generate an image (9Router) and save the file path",
 		promptGuidelines: [
-			"Use nr_image_generate when the user asks to generate, draw, render, design, or create an image, icon, logo, symbol, illustration, mockup, or concept art.",
-			"Write a detailed prompt (subject, style, colors, composition). Do not pass model unless the user names a specific image model.",
-			"Optional: size (e.g. 1024x1024), quality (standard|hd), n (1-4), filename. Some providers ignore size/quality.",
-			"After success, report the saved file path to the user. Do not claim you embedded the image in the chat unless the tool result includes image content.",
+			"Call nr_image_generate to create images, icons, logos, illustrations, or mockups.",
+			"Write a detailed prompt (subject, style, colors, composition).",
+			"Omit model unless the user names a specific image model; optional size, quality, n, filename.",
+			"Tell the user the saved file path from the tool result.",
 		],
 		parameters: Type.Object({
-			prompt: Type.String({ description: "Detailed image generation prompt" }),
-			model: Type.Optional(Type.String({ description: "Override default image model id" })),
-			size: Type.Optional(Type.String({ description: "e.g. 1024x1024, 1792x1024" })),
-			n: Type.Optional(Type.Integer({ description: "Images to generate (1-4)", minimum: 1, maximum: 4 })),
-			quality: Type.Optional(Type.String({ description: "standard | hd" })),
-			filename: Type.Optional(Type.String({ description: "Output filename only (no directories)" })),
+			prompt: Type.String({ description: "Image prompt: subject, style, colors, composition" }),
+			model: Type.Optional(Type.String({ description: "Image model id (optional; uses /9router-tools default)" })),
+			size: Type.Optional(Type.String({ description: "Size if supported, e.g. 1024x1024" })),
+			n: Type.Optional(Type.Integer({ description: "Number of images, 1–4 (default 1)", minimum: 1, maximum: 4 })),
+			quality: Type.Optional(Type.String({ description: "standard or hd when supported" })),
+			filename: Type.Optional(Type.String({ description: "Output file name only, no folders" })),
 		}),
 		async execute(_id, params, signal, onUpdate, ctx) {
 			const cfg = loadRaw();
@@ -662,19 +662,19 @@ function registerTtsTool(pi: ExtensionAPI) {
 	const cap = CAPS.find((c) => c.id === "tts")!;
 	pi.registerTool({
 		name: cap.tool,
-		label: cap.label,
+		label: "Speech",
 		description:
-			"Convert text to speech via 9Router and save an audio file (mp3/wav). Use for narration, voiceover, or reading text aloud. Default voice/model is set in /9router-tools.",
-		promptSnippet: "Text-to-speech via 9Router (saves audio file)",
+			"Convert text to speech through 9Router and save an audio file. Use for narration or voiceover. Uses the default TTS model from /9router-tools unless you pass model.",
+		promptSnippet: "Text-to-speech (9Router) — saves an audio file",
 		promptGuidelines: [
-			"Use nr_tts when the user wants speech, voiceover, narration, TTS, or an audio reading of text.",
-			"Pass the full text in input. Omit model unless the user requests a specific voice/model id.",
-			"Return the saved audio file path. Do not invent playback inside the terminal.",
+			"Call nr_tts to turn text into spoken audio (narration, voiceover, read-aloud).",
+			"Pass the full text in input. Omit model unless the user picks a specific voice/model.",
+			"Report the saved audio file path from the tool result.",
 		],
 		parameters: Type.Object({
 			input: Type.String({ description: "Text to speak" }),
-			model: Type.Optional(Type.String({ description: "Override default TTS model/voice id" })),
-			filename: Type.Optional(Type.String({ description: "Output filename only" })),
+			model: Type.Optional(Type.String({ description: "TTS model/voice id (optional)" })),
+			filename: Type.Optional(Type.String({ description: "Output file name only" })),
 		}),
 		async execute(_id, params, signal, onUpdate) {
 			const cfg = loadRaw();
@@ -719,21 +719,20 @@ function registerEmbedTool(pi: ExtensionAPI) {
 	const cap = CAPS.find((c) => c.id === "embed")!;
 	pi.registerTool({
 		name: cap.tool,
-		label: cap.label,
+		label: "Embed",
 		description:
-			"Create text embeddings via 9Router for RAG/similarity. By default returns dimensions + a short preview only (not full vectors). Set full=true only when the user needs the complete vector arrays.",
-		promptSnippet: "Create embeddings via 9Router",
+			"Create text embeddings through 9Router for RAG or similarity. Returns dimensions and a short preview by default. Set full=true only when full vector arrays are required.",
+		promptSnippet: "Create text embeddings (9Router)",
 		promptGuidelines: [
-			"Use nr_embed for embeddings, vectors, semantic similarity, or RAG chunk encoding.",
-			"Pass one string, or multiple chunks separated by a line containing only --- .",
-			"Omit model unless the user specifies one. Optional dimensions for OpenAI v3-style models.",
-			"Do not set full=true unless necessary — full vectors are huge and waste context.",
+			"Call nr_embed for embeddings, vectors, similarity, or RAG chunk encoding.",
+			"Pass one string, or several chunks separated by a line that is only --- .",
+			"Omit model unless specified. Avoid full=true unless the user needs complete vectors.",
 		],
 		parameters: Type.Object({
-			input: Type.String({ description: "Text, or multiple texts split by \\n---\\n" }),
-			model: Type.Optional(Type.String({ description: "Override default embedding model" })),
-			dimensions: Type.Optional(Type.Integer({ description: "Optional dims (OpenAI v3)", minimum: 1 })),
-			full: Type.Optional(Type.Boolean({ description: "Include full vectors (default false)" })),
+			input: Type.String({ description: "Text to embed, or chunks split by a --- line" }),
+			model: Type.Optional(Type.String({ description: "Embedding model id (optional)" })),
+			dimensions: Type.Optional(Type.Integer({ description: "Vector size when supported", minimum: 1 })),
+			full: Type.Optional(Type.Boolean({ description: "Return full vectors (default false)" })),
 		}),
 		async execute(_id, params, signal, onUpdate) {
 			const cfg = loadRaw();
@@ -784,24 +783,24 @@ function registerWebSearchTool(pi: ExtensionAPI) {
 	const cap = CAPS.find((c) => c.id === "web_search")!;
 	pi.registerTool({
 		name: cap.tool,
-		label: cap.label,
+		label: "Search",
 		description:
-			"Search the web via 9Router (Exa/Tavily/Brave/…). Returns titles, URLs, snippets. For full page text of a known URL use nr_web_fetch. Default search model is set in /9router-tools.",
-		promptSnippet: "Web search via 9Router",
+			"Search the web through 9Router. Returns titles, URLs, and snippets. For full page text of a known URL, use nr_web_fetch. Uses the default search model from /9router-tools unless you pass model.",
+		promptSnippet: "Search the web (9Router)",
 		promptGuidelines: [
-			"Use nr_web_search for current information, docs lookup, news, or finding sources on the web.",
-			"Write a clear natural-language query. Omit model unless the user picks a provider (e.g. exa/search).",
+			"Call nr_web_search for current web info, docs, news, or sources.",
+			"Write a clear natural-language query. Omit model unless the user names a provider (e.g. exa/search).",
 			"Optional: max_results (default 5), search_type (web|news), country, language.",
-			"After search, use nr_web_fetch on the best URLs when you need full page content.",
-			"Prefer nr_web_search over guessing. Do not use it for local codebase questions.",
+			"Follow up with nr_web_fetch on the best URLs when you need full page content.",
+			"Do not use nr_web_search for local codebase questions.",
 		],
 		parameters: Type.Object({
-			query: Type.String({ description: "Search query" }),
-			model: Type.Optional(Type.String({ description: "Override default search model id" })),
-			max_results: Type.Optional(Type.Integer({ description: "1-20, default 5", minimum: 1, maximum: 20 })),
-			search_type: Type.Optional(Type.String({ description: "web | news" })),
-			country: Type.Optional(Type.String({ description: "Country bias if supported" })),
-			language: Type.Optional(Type.String({ description: "Language bias if supported" })),
+			query: Type.String({ description: "What to search for" }),
+			model: Type.Optional(Type.String({ description: "Search model id (optional)" })),
+			max_results: Type.Optional(Type.Integer({ description: "Result count, 1–20 (default 5)", minimum: 1, maximum: 20 })),
+			search_type: Type.Optional(Type.String({ description: "web or news when supported" })),
+			country: Type.Optional(Type.String({ description: "Country bias when supported" })),
+			language: Type.Optional(Type.String({ description: "Language bias when supported" })),
 		}),
 		async execute(_id, params, signal, onUpdate) {
 			const cfg = loadRaw();
@@ -862,21 +861,21 @@ function registerWebFetchTool(pi: ExtensionAPI) {
 	const cap = CAPS.find((c) => c.id === "web_fetch")!;
 	pi.registerTool({
 		name: cap.tool,
-		label: cap.label,
+		label: "Fetch",
 		description:
-			"Fetch a URL as markdown/text/HTML via 9Router (Exa/Firecrawl/Jina/Tavily/…). Use when you already have a URL. For discovery use nr_web_search first.",
-		promptSnippet: "Fetch URL content via 9Router",
+			"Fetch a URL as markdown, text, or HTML through 9Router. Use when you already have a URL. For discovery, use nr_web_search first.",
+		promptSnippet: "Fetch a URL as markdown (9Router)",
 		promptGuidelines: [
-			"Use nr_web_fetch when you have an absolute http(s) URL and need page content.",
-			"Default format is markdown. Optional max_characters to truncate long pages.",
-			"Omit model unless the user specifies a fetch provider (e.g. exa/fetch).",
-			"Do not use nr_web_fetch for local files — use the read tool instead.",
+			"Call nr_web_fetch for absolute http(s) URLs when you need page content.",
+			"Default format is markdown. Use max_characters to cap long pages.",
+			"Omit model unless the user names a fetch provider (e.g. exa/fetch).",
+			"For local files use the read tool, not nr_web_fetch.",
 		],
 		parameters: Type.Object({
-			url: Type.String({ description: "Absolute http(s) URL" }),
-			model: Type.Optional(Type.String({ description: "Override default fetch model" })),
-			format: Type.Optional(Type.String({ description: "markdown | text | html" })),
-			max_characters: Type.Optional(Type.Integer({ description: "Truncate length", minimum: 0 })),
+			url: Type.String({ description: "Absolute http(s) URL to fetch" }),
+			model: Type.Optional(Type.String({ description: "Fetch model id (optional)" })),
+			format: Type.Optional(Type.String({ description: "markdown, text, or html (default markdown)" })),
+			max_characters: Type.Optional(Type.Integer({ description: "Max characters to return", minimum: 0 })),
 		}),
 		async execute(_id, params, signal, onUpdate) {
 			const cfg = loadRaw();
@@ -952,7 +951,7 @@ export default function (pi: ExtensionAPI) {
 	pi.events.on("9router:synced", () => applyFromDisk());
 
 	pi.registerCommand("9router-tools", {
-		description: "9Router tools settings: enable capabilities, default models, output folder",
+		description: "9Router tools — enable image, speech, search, fetch; set defaults",
 		handler: async (_args, ctx) => {
 			if (!ctx.hasUI && ctx.mode !== "tui") {
 				ctx.ui.notify("/9router-tools needs interactive mode", "error");

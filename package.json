@@ -1,24 +1,37 @@
 {
-  "name": "pi-9router",
-  "version": "1.3.0",
-  "description": "Pi extensions for 9Router: chat model sync + toggleable image, TTS, embed, and web tools",
+  "name": "@qmahyar/pi-9router",
+  "version": "1.0.0",
+  "description": "Connect pi to 9Router — multi-provider chat models plus image, speech, search, and fetch tools",
   "keywords": [
     "pi-package",
     "pi",
+    "pi-coding-agent",
     "extension",
     "9router",
     "ninerouter",
-    "models",
+    "llm",
     "openai-compatible",
-    "tts",
     "image",
-    "web-search"
+    "tts",
+    "web-search",
+    "embeddings"
   ],
   "license": "MIT",
+  "author": "QMahyar",
+  "homepage": "https://github.com/QMahyar/pi-9router#readme",
+  "bugs": {
+    "url": "https://github.com/QMahyar/pi-9router/issues"
+  },
   "repository": {
     "type": "git",
-    "url": "https://github.com/QMahyar/pi-9router.git"
+    "url": "git+https://github.com/QMahyar/pi-9router.git"
   },
+  "files": [
+    "extensions",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
   "pi": {
     "extensions": [
       "./extensions"

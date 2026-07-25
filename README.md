@@ -1,151 +1,89 @@
-# pi-9router
+<p align="center">
+  <a href="https://9router.com"><strong>9Router</strong></a>
+  &nbsp;×&nbsp;
+  <a href="https://pi.dev"><strong>pi</strong></a>
+</p>
 
-[Pi](https://pi.dev) extensions for **[9Router](https://github.com/decolua/9router)** — one local gateway, many providers.
+<h1 align="center">@qmahyar/pi-9router</h1>
 
-| Command | Purpose |
-|---------|---------|
-| **`/9router`** | Connect to 9Router, sync model catalogs, register **chat** models in pi |
-| **`/9router-tools`** | Turn non-chat tools on/off, pick default models, set output folder |
+<p align="center">
+  <strong>One gateway. Many providers. Full tool suite for pi.</strong><br />
+  Sync chat models from <a href="https://9router.com">9Router</a> into pi, then turn on image, speech, search, and fetch tools when you need them.
+</p>
 
-> **Speech-to-text / dictation is not part of this package.**  
-> Use a dedicated app (e.g. [Superwhisper](https://superwhisper.com), Spokenly, or OS dictation) to put voice into the editor. That keeps pi’s shortcut keys free and avoids fragile mic capture in the terminal.
+<p align="center">
+  <a href="https://www.npmjs.com/package/@qmahyar/pi-9router"><img alt="npm" src="https://img.shields.io/npm/v/@qmahyar/pi-9router?style=flat-square" /></a>
+  <a href="https://pi.dev/packages"><img alt="pi-package" src="https://img.shields.io/badge/pi.dev-package-111?style=flat-square" /></a>
+  <a href="https://github.com/QMahyar/pi-9router/blob/master/LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
+</p>
+
+---
 
 ## Install
+
+```bash
+pi install npm:@qmahyar/pi-9router
+```
+
+Or from git:
 
 ```bash
 pi install git:github.com/QMahyar/pi-9router
 ```
 
-Requires a running 9Router instance (default `http://localhost:20128`).
+Requires a running [9Router](https://9router.com) instance (`npm i -g 9router` → default `http://localhost:20128`).
+
+## What you get
+
+| Command | Role |
+|---------|------|
+| **`/9router`** | Connect · sync catalogs · register **chat** models as provider `9router` |
+| **`/9router-tools`** | Enable tools · set default models · output folder |
+
+| Tool | On by default | Does |
+|------|---------------|------|
+| `nr_image_generate` | Yes | Text → image file |
+| `nr_tts` | Yes | Text → speech file |
+| `nr_web_search` | Yes | Live web search |
+| `nr_web_fetch` | Yes | URL → markdown |
+| `nr_embed` | No | Text → embeddings |
+
+**Off tools leave the model context.** Only enabled tools expose schema + usage guidelines to the agent.
+
+## 60-second start
+
+```text
+1. 9router                          # start the gateway
+2. /9router  →  Sync models
+3. /model    →  provider 9router
+4. /9router-tools  →  pick defaults
+```
+
+## Pair with Exa (optional)
+
+For dedicated **Exa** neural search with multi-key rotation (separate from 9Router’s web tools):
 
 ```bash
-npm install -g 9router
-9router
+pi install npm:@qmahyar/pi-exa-search
 ```
 
-## Quick start
+→ [**@qmahyar/pi-exa-search**](https://github.com/QMahyar/pi-exa-search) · [npm](https://www.npmjs.com/package/@qmahyar/pi-exa-search)
 
-1. Start 9Router  
-2. In pi: **`/9router`** → **Sync models**  
-3. **`/model`** → provider **9router** (chat)  
-4. **`/9router-tools`** → enable tools and set defaults  
-
-## Architecture
-
-```
-┌─────────────┐   OpenAI-compatible HTTP    ┌──────────────┐
-│     pi      │ ──────────────────────────► │   9Router    │
-│             │   /v1/chat/completions      │  :20128      │
-│  extensions │   /v1/images/generations    │              │
-│             │   /v1/audio/speech          │  → providers │
-│             │   /v1/embeddings            │              │
-│             │   /v1/search  /v1/web/fetch │              │
-└─────────────┘                             └──────────────┘
-       │
-       ▼
- ~/.pi/agent/9router.json
-```
-
-| Extension | File | Responsibility |
-|-----------|------|----------------|
-| Core | `extensions/9router.ts` | Endpoint, API key, catalog sync, `registerProvider("9router")` for chat |
-| Tools | `extensions/9router-tools.ts` | LLM tools + `/9router-tools` settings UI |
-
-Both share **`~/.pi/agent/9router.json`**.
-
-## Chat models (`/9router`)
-
-**Sync models** pulls:
-
-| Kind | Endpoint |
-|------|----------|
-| chat | `GET /v1/models` |
-| image | `GET /v1/models/image` |
-| tts | `GET /v1/models/tts` |
-| embedding | `GET /v1/models/embedding` |
-| web | `GET /v1/models/web` |
-| … | plus stt / image-to-text for browsing only |
-
-Only **chat** models are registered with pi’s model picker (`provider: 9router`, `api: openai-completions`, `baseUrl: {endpoint}/v1`), using each model’s `capabilities` (context window, vision, reasoning, …).
-
-Menu:
-
-```
-Sync models
-Connection          # endpoint, API key, test
-Browse catalog
-Status
-Unregister chat models
-Close
-```
-
-## Tools (`/9router-tools`)
-
-| Tool | Default | 9Router API | Use for |
-|------|---------|-------------|---------|
-| `nr_image_generate` | On | `POST /v1/images/generations` | Icons, illustrations, mockups |
-| `nr_tts` | On | `POST /v1/audio/speech` | Narration → audio file |
-| `nr_embed` | Off | `POST /v1/embeddings` | RAG / vectors |
-| `nr_web_search` | On | `POST /v1/search` | Live web search |
-| `nr_web_fetch` | On | `POST /v1/web/fetch` | URL → markdown |
-
-### On vs off (model context)
-
-When a tool is **On**:
-
-- It is in pi’s active tool list  
-- The model sees its **schema**, **promptSnippet**, and **promptGuidelines**
-
-When **Off**:
-
-- Removed via `setActiveTools`  
-- **Nothing** about that tool is injected into the system prompt  
-
-Settings list (columnar):
-
-```
-Image generation    On   model-id…          N models
-Text to speech      On   …
-Embeddings          Off  —
-Web search          On   …
-Web fetch           On   …
-────────────────
-Output folder
-Status
-Close
-```
-
-Generated files go to `~/.pi/agent/9router-output/` (configurable).
-
-## Config
-
-`~/.pi/agent/9router.json` (example):
-
-```json
-{
-  "endpoint": "http://localhost:20128",
-  "apiKey": "sk-…",
-  "lastSync": "2026-07-25T12:00:00.000Z",
-  "chatModels": [],
-  "catalog": [],
-  "counts": { "chat": 95, "image": 6, "tts": 8, "embedding": 13, "web": 2 },
-  "capabilities": {
-    "image": { "enabled": true, "model": "gemini/gemini-3-pro-image-preview" },
-    "web_search": { "enabled": true, "model": "exa/search" }
-  },
-  "outputDir": "C:/Users/you/.pi/agent/9router-output"
-}
-```
-
-Environment fallbacks: `NINEROUTER_URL`, `NINEROUTER_KEY`.
+Use **one** search stack at a time if you want to avoid overlapping tools.
 
 ## Docs
 
-| Doc | Contents |
-|-----|----------|
-| [docs/setup.md](docs/setup.md) | Install, first run |
-| [docs/usage.md](docs/usage.md) | Menus, tools, on/off behavior |
-| [docs/dev.md](docs/dev.md) | Extension layout for contributors |
+| Doc | |
+|-----|--|
+| [Setup](docs/setup.md) | Install, first run, env vars |
+| [Usage](docs/usage.md) | Menus, tools, on/off behavior |
+| [Dev](docs/dev.md) | Layout for contributors |
+
+## Links
+
+- [9Router](https://9router.com) · [9Router on GitHub](https://github.com/decolua/9router)
+- [pi.dev](https://pi.dev) · [Package gallery](https://pi.dev/packages)
+- [This package on npm](https://www.npmjs.com/package/@qmahyar/pi-9router)
 
 ## License
 
