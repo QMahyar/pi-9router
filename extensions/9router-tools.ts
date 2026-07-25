@@ -1,16 +1,17 @@
 /**
  * pi-9router-tools — Capability tools for 9Router (companion to 9router.ts)
  *
- * Config UI:  /9router-tools
- * Voice input: Ctrl+Shift+V (only when STT is enabled) → mic → STT → editor
+ * Config UI: /9router-tools
  *
- * Tools (toggle in /9router-tools; inactive tools are removed from the model context):
+ * Tools (toggle in UI; off tools are removed from the model context):
  *   nr_image_generate  POST /v1/images/generations
  *   nr_tts             POST /v1/audio/speech
- *   nr_stt             POST /v1/audio/transcriptions
  *   nr_embed           POST /v1/embeddings
  *   nr_web_search      POST /v1/search
  *   nr_web_fetch       POST /v1/web/fetch
+ *
+ * Speech-to-text / mic input is intentionally not included — use a dedicated
+ * OS dictation app (e.g. Superwhisper, Spokenly) for voice → editor.
  *
  * Shared config: ~/.pi/agent/9router.json
  */
@@ -24,25 +25,18 @@ import {
 	readFileSync,
 	writeFileSync,
 	statSync,
-	unlinkSync,
-	readdirSync,
 } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { randomBytes } from "node:crypto";
-import { spawn, execFileSync } from "node:child_process";
-import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
 
 // ── Shared config ───────────────────────────────────────────────
 
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "9router.json");
 const DEFAULT_ENDPOINT = "http://localhost:20128";
 const DEFAULT_OUTPUT_DIR = join(homedir(), ".pi", "agent", "9router-output");
-const VOICE_SHORTCUT = "ctrl+shift+v";
-const DEFAULT_VOICE_SECONDS = 8;
 
-type CapId = "image" | "tts" | "stt" | "embed" | "web_search" | "web_fetch";
+type CapId = "image" | "tts" | "embed" | "web_search" | "web_fetch";
 
 interface CatalogEntry {
 	id: string;
@@ -58,15 +52,6 @@ interface CapState {
 	model?: string;
 }
 
-interface VoiceSettings {
-	/** Recording length in seconds (3–60) */
-	durationSec?: number;
-	/** Windows dshow device name, optional */
-	device?: string;
-	/** replace editor text vs append */
-	mode?: "replace" | "append";
-}
-
 interface ToolsConfigSlice {
 	endpoint?: string;
 	apiKey?: string;
@@ -75,9 +60,6 @@ interface ToolsConfigSlice {
 	lastSync?: string;
 	capabilities?: Partial<Record<CapId, CapState>>;
 	outputDir?: string;
-	voice?: VoiceSettings;
-	/** Optional absolute path to ffmpeg */
-	ffmpegPath?: string;
 }
 
 interface CapDef {
@@ -86,7 +68,6 @@ interface CapDef {
 	label: string;
 	catalogKind: string | ((e: CatalogEntry) => boolean);
 	defaultEnabled: boolean;
-	/** Short row subtitle in settings */
 	blurb: string;
 }
 
@@ -106,14 +87,6 @@ const CAPS: CapDef[] = [
 		catalogKind: "tts",
 		defaultEnabled: true,
 		blurb: "Text → audio file",
-	},
-	{
-		id: "stt",
-		tool: "nr_stt",
-		label: "Speech to text",
-		catalogKind: "stt",
-		defaultEnabled: true,
-		blurb: "Audio file / voice input",
 	},
 	{
 		id: "embed",
@@ -164,10 +137,16 @@ function saveRaw(patch: Partial<ToolsConfigSlice>): ToolsConfigSlice {
 	if (patch.capabilities) {
 		next.capabilities = { ...(cur.capabilities || {}), ...patch.capabilities };
 	}
-	if (patch.voice) {
-		next.voice = { ...(cur.voice || {}), ...patch.voice };
+	// Drop legacy keys if present (stt / voice / ffmpeg from older versions)
+	const out: Record<string, unknown> = { ...next };
+	delete out.voice;
+	delete out.ffmpegPath;
+	if (out.capabilities && typeof out.capabilities === "object") {
+		const caps = { ...(out.capabilities as Record<string, unknown>) };
+		delete caps.stt;
+		out.capabilities = caps;
 	}
-	writeFileSync(CONFIG_PATH, JSON.stringify(next, null, 2));
+	writeFileSync(CONFIG_PATH, JSON.stringify(out, null, 2));
 	return next;
 }
 
@@ -203,108 +182,6 @@ function resolveModel(cfg: ToolsConfigSlice, cap: CapDef, override?: string): st
 	const state = getCapState(cfg, cap);
 	if (state.model?.trim()) return state.model.trim();
 	return modelsForCap(cfg, cap)[0]?.id || null;
-}
-
-function voiceSettings(cfg: ToolsConfigSlice): Required<Pick<VoiceSettings, "durationSec" | "mode">> & VoiceSettings {
-	return {
-		durationSec: Math.min(60, Math.max(3, cfg.voice?.durationSec ?? DEFAULT_VOICE_SECONDS)),
-		mode: cfg.voice?.mode === "append" ? "append" : "replace",
-		device: cfg.voice?.device,
-	};
-}
-
-// ── FFmpeg resolution ───────────────────────────────────────────
-
-function whichOnPath(bin: string): string | undefined {
-	try {
-		if (process.platform === "win32") {
-			const out = execFileSync("where.exe", [bin], { encoding: "utf8" }).trim().split(/\r?\n/)[0];
-			return out && existsSync(out) ? out : undefined;
-		}
-		const out = execFileSync("which", [bin], { encoding: "utf8" }).trim();
-		return out && existsSync(out) ? out : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-function tryFfmpegStatic(): string | undefined {
-	const candidates: string[] = [];
-
-	const tryRequireFrom = (fromFile: string) => {
-		try {
-			const req = createRequire(fromFile);
-			const bin = req("ffmpeg-static") as string;
-			if (typeof bin === "string" && bin) candidates.push(bin);
-		} catch {
-			/* missing */
-		}
-	};
-
-	// 1) Extension file location (jiti / file URL)
-	try {
-		const extFile = fileURLToPath(import.meta.url);
-		tryRequireFrom(extFile);
-		// walk up a few parents for node_modules/ffmpeg-static
-		let dir = dirname(extFile);
-		for (let i = 0; i < 6; i++) {
-			tryRequireFrom(join(dir, "package.json"));
-			const win = join(dir, "node_modules", "ffmpeg-static", "ffmpeg.exe");
-			const nix = join(dir, "node_modules", "ffmpeg-static", "ffmpeg");
-			if (existsSync(win)) candidates.push(win);
-			if (existsSync(nix)) candidates.push(nix);
-			const parent = dirname(dir);
-			if (parent === dir) break;
-			dir = parent;
-		}
-	} catch {
-		/* import.meta may be unavailable */
-	}
-
-	// 2) Common pi package install roots
-	const roots = [
-		join(homedir(), ".pi", "agent", "npm"),
-		join(homedir(), ".pi", "agent", "git"),
-		join(homedir(), ".pi", "npm"),
-		join(homedir(), ".pi", "git"),
-		process.cwd(),
-	];
-	for (const root of roots) {
-		tryRequireFrom(join(root, "package.json"));
-		// shallow scan one level of package folders
-		try {
-			for (const name of readdirSync(root, { withFileTypes: true })) {
-				if (!name.isDirectory()) continue;
-				const base = join(root, name.name);
-				tryRequireFrom(join(base, "package.json"));
-				const win = join(base, "node_modules", "ffmpeg-static", "ffmpeg.exe");
-				const nix = join(base, "node_modules", "ffmpeg-static", "ffmpeg");
-				if (existsSync(win)) candidates.push(win);
-				if (existsSync(nix)) candidates.push(nix);
-			}
-		} catch {
-			/* */
-		}
-	}
-
-	for (const c of candidates) {
-		if (c && existsSync(c)) return c;
-	}
-	return undefined;
-}
-
-function resolveFfmpeg(cfg?: ToolsConfigSlice): { path?: string; source?: string } {
-	const c = cfg || loadRaw();
-	if (c.ffmpegPath && existsSync(c.ffmpegPath)) {
-		return { path: c.ffmpegPath, source: "config" };
-	}
-	const env = process.env.FFMPEG_PATH || process.env.FFMPEG_BINARY;
-	if (env && existsSync(env)) return { path: env, source: "env" };
-	const onPath = whichOnPath("ffmpeg") || whichOnPath("ffmpeg.exe");
-	if (onPath) return { path: onPath, source: "PATH" };
-	const bundled = tryFfmpegStatic();
-	if (bundled) return { path: bundled, source: "ffmpeg-static" };
-	return {};
 }
 
 // ── HTTP ────────────────────────────────────────────────────────
@@ -382,38 +259,7 @@ async function postBinary(
 	}
 }
 
-async function postMultipart(
-	url: string,
-	apiKey: string,
-	form: FormData,
-	signal?: AbortSignal,
-): Promise<{ ok: true; data: any } | { ok: false; status: number; error: string }> {
-	try {
-		const headers: Record<string, string> = {};
-		if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-		const res = await fetch(url, { method: "POST", headers, body: form, signal });
-		const text = await res.text();
-		let data: any = text;
-		try {
-			data = text ? JSON.parse(text) : null;
-		} catch {
-			/* keep text */
-		}
-		if (!res.ok) {
-			const msg =
-				typeof data === "string"
-					? data.slice(0, 400)
-					: data?.error?.message || JSON.stringify(data).slice(0, 400);
-			return { ok: false, status: res.status, error: msg || res.statusText };
-		}
-		return { ok: true, data };
-	} catch (err: any) {
-		if (err?.name === "AbortError") return { ok: false, status: 0, error: "aborted" };
-		return { ok: false, status: 0, error: err?.message || String(err) };
-	}
-}
-
-// ── File / misc helpers ─────────────────────────────────────────
+// ── File helpers ────────────────────────────────────────────────
 
 function ensureDir(dir: string) {
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
@@ -451,7 +297,6 @@ function extFromContentType(ct: string, fallback: string): string {
 	if (c.includes("mp3") || c.includes("mpeg")) return ".mp3";
 	if (c.includes("wav")) return ".wav";
 	if (c.includes("ogg")) return ".ogg";
-	if (c.includes("webm")) return ".webm";
 	return fallback;
 }
 
@@ -485,13 +330,6 @@ async function downloadUrl(url: string, signal?: AbortSignal) {
 	}
 }
 
-function resolveUserPath(p: string, cwd?: string): string {
-	if (p.startsWith("@")) p = p.slice(1);
-	if (p.startsWith("~")) p = join(homedir(), p.slice(1));
-	if (!isAbsolute(p)) p = resolve(cwd || process.cwd(), p);
-	return p;
-}
-
 function toolError(message: string, details: Record<string, unknown> = {}) {
 	return {
 		content: [{ type: "text" as const, text: message }],
@@ -522,11 +360,20 @@ function shortModel(id?: string, max = 36): string {
 	return id.length <= max ? id : "…" + id.slice(-(max - 1));
 }
 
+function padLabel(label: string, width: number): string {
+	if (label.length >= width) return label.slice(0, width);
+	return label + " ".repeat(width - label.length);
+}
+
 // ── Active tools ────────────────────────────────────────────────
 
 function applyToolActivation(pi: ExtensionAPI, cfg: ToolsConfigSlice): void {
 	const active = new Set(pi.getActiveTools());
 	const allKnown = new Set(pi.getAllTools().map((t) => t.name));
+
+	// Always remove legacy STT tool if an older session still has it registered
+	active.delete("nr_stt");
+
 	for (const cap of CAPS) {
 		if (!allKnown.has(cap.tool)) continue;
 		if (getCapState(cfg, cap).enabled) active.add(cap.tool);
@@ -535,286 +382,13 @@ function applyToolActivation(pi: ExtensionAPI, cfg: ToolsConfigSlice): void {
 	pi.setActiveTools([...active]);
 }
 
-// ── STT helper (shared by tool + voice shortcut) ────────────────
-
-async function transcribeFile(
-	cfg: ToolsConfigSlice,
-	filePath: string,
-	opts: { model?: string; language?: string; prompt?: string; response_format?: string } = {},
-	signal?: AbortSignal,
-): Promise<{ ok: true; text: string; model: string } | { ok: false; error: string }> {
-	const cap = CAPS.find((c) => c.id === "stt")!;
-	const blocked = needCap(cfg, cap);
-	if (blocked) return { ok: false, error: blocked };
-	const model = resolveModel(cfg, cap, opts.model);
-	if (!model) return { ok: false, error: "No STT model. Sync /9router and set a default in /9router-tools." };
-	if (!existsSync(filePath)) return { ok: false, error: `File not found: ${filePath}` };
-
-	const bytes = readFileSync(filePath);
-	const form = new FormData();
-	form.append("model", model);
-	form.append("file", new Blob([new Uint8Array(bytes)]), basename(filePath));
-	if (opts.language) form.append("language", opts.language);
-	if (opts.prompt) form.append("prompt", opts.prompt);
-	if (opts.response_format) form.append("response_format", opts.response_format);
-
-	const res = await postMultipart(`${endpointOf(cfg)}/v1/audio/transcriptions`, apiKeyOf(cfg), form, signal);
-	if (!res.ok) return { ok: false, error: `STT failed (${res.status}): ${res.error}` };
-	const text =
-		typeof res.data === "string" ? res.data : res.data?.text || JSON.stringify(res.data);
-	return { ok: true, text: String(text).trim(), model };
-}
-
-// ── Mic recording ───────────────────────────────────────────────
-
-/**
- * List Windows DirectShow audio capture devices via ffmpeg.
- * ffmpeg always exits non-zero for -list_devices; names are on stderr.
- */
-function listWindowsAudioDevices(ffmpegPath: string): string[] {
-	let text = "";
-	try {
-		execFileSync(
-			ffmpegPath,
-			["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
-			{ encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
-		);
-	} catch (err: any) {
-		const stderr = err?.stderr;
-		text = Buffer.isBuffer(stderr)
-			? stderr.toString("utf8")
-			: String(stderr || err?.message || err);
-	}
-
-	const names: string[] = [];
-	const seen = new Set<string>();
-
-	// Primary:  "Microphone Name" (audio)
-	const reAudio = /"([^"]+)"\s*\(audio\)/gi;
-	let m: RegExpExecArray | null;
-	while ((m = reAudio.exec(text))) {
-		const n = m[1].trim();
-		if (n && !seen.has(n.toLowerCase())) {
-			seen.add(n.toLowerCase());
-			names.push(n);
-		}
-	}
-
-	// Fallback: parse the "DirectShow audio devices" section only
-	if (!names.length) {
-		const audioSection = text.split(/DirectShow\s+audio\s+devices/i)[1] || "";
-		const beforeVideo = audioSection.split(/DirectShow\s+video\s+devices/i)[0] || audioSection;
-		const reQuoted = /"([^"]+)"/g;
-		while ((m = reQuoted.exec(beforeVideo))) {
-			const n = m[1].trim();
-			if (n && !seen.has(n.toLowerCase()) && !/^dummy$/i.test(n)) {
-				seen.add(n.toLowerCase());
-				names.push(n);
-			}
-		}
-	}
-
-	return names;
-}
-
-/**
- * dshow input for spawn argv (not shell):
- *   audio=Microphone (Realtek(R) Audio)
- * Pass as ONE array element so spaces are fine. Do NOT wrap in extra quotes —
- * ffmpeg would look for a device name that includes the quote characters.
- */
-function dshowAudioInput(deviceName: string): string {
-	const cleaned = deviceName.replace(/"/g, "").trim();
-	return `audio=${cleaned}`;
-}
-
-function recordMicrophone(opts: {
-	ffmpegPath: string;
-	seconds: number;
-	device?: string;
-	outPath: string;
-}): Promise<{ ok: true } | { ok: false; error: string }> {
-	return new Promise((resolvePromise) => {
-		const { ffmpegPath, seconds, device, outPath } = opts;
-		ensureDir(dirname(outPath));
-		const args: string[] = ["-y", "-hide_banner", "-loglevel", "error"];
-
-		if (process.platform === "win32") {
-			if (!device || !device.trim() || /^default$/i.test(device)) {
-				resolvePromise({
-					ok: false,
-					error:
-						'No microphone selected. Open /9router-tools → Voice input → pick a mic (Windows has no "default" dshow device).',
-				});
-				return;
-			}
-			// Critical: quotes around the device name for dshow
-			args.push(
-				"-f",
-				"dshow",
-				"-i",
-				dshowAudioInput(device),
-				"-t",
-				String(seconds),
-				"-ac",
-				"1",
-				"-ar",
-				"16000",
-				outPath,
-			);
-		} else if (process.platform === "darwin") {
-			args.push("-f", "avfoundation", "-i", ":0", "-t", String(seconds), "-ac", "1", "-ar", "16000", outPath);
-		} else {
-			args.push("-f", "pulse", "-i", "default", "-t", String(seconds), "-ac", "1", "-ar", "16000", outPath);
-		}
-
-		const child = spawn(ffmpegPath, args, { stdio: ["ignore", "pipe", "pipe"] });
-		let err = "";
-		child.stderr?.on("data", (d) => {
-			err += String(d);
-		});
-		child.on("error", (e) => resolvePromise({ ok: false, error: e.message }));
-		child.on("close", (code) => {
-			if (code === 0 && existsSync(outPath) && statSync(outPath).size > 100) {
-				resolvePromise({ ok: true });
-			} else {
-				const hint =
-					process.platform === "win32"
-						? " Pick the correct mic in /9router-tools → Voice input."
-						: "";
-				const msg = (err.trim() || `ffmpeg exited ${code}.`) + hint;
-				resolvePromise({ ok: false, error: msg.slice(0, 400) });
-			}
-		});
-	});
-}
-
-async function ensureWindowsMic(
-	ui: ExtensionContext["ui"],
-	cfg: ToolsConfigSlice,
-	ffmpegPath: string,
-	forcePick = false,
-): Promise<string | null> {
-	const devices = listWindowsAudioDevices(ffmpegPath);
-	if (!devices.length) {
-		ui.notify(
-			"No DirectShow audio devices found. Check Windows mic permissions and that ffmpeg can see devices.",
-			"error",
-		);
-		return null;
-	}
-
-	const saved = cfg.voice?.device?.trim();
-	const savedOk = saved && devices.some((d) => d === saved);
-
-	if (!forcePick && savedOk) return saved!;
-
-	if (!forcePick && devices.length === 1) {
-		saveRaw({ voice: { device: devices[0] } });
-		return devices[0];
-	}
-
-	const items = devices.map((d) => (d === saved ? `* ${d}` : `  ${d}`));
-	items.push("Cancel");
-	const pick = await ui.select("Microphone for voice input", items);
-	if (!pick || pick === "Cancel") return null;
-	const name = pick.replace(/^\*\s/, "").replace(/^\s\s/, "").trim();
-	if (!name || !devices.includes(name)) return null;
-	saveRaw({ voice: { device: name } });
-	return name;
-}
-
-async function runVoiceToEditor(ctx: ExtensionContext): Promise<void> {
-	const ui = ctx.ui;
-	const cfg = loadRaw();
-	const sttCap = CAPS.find((c) => c.id === "stt")!;
-	if (!getCapState(cfg, sttCap).enabled) {
-		ui.notify("Speech to text is off. Enable it in /9router-tools.", "warning");
-		return;
-	}
-
-	const ff = resolveFfmpeg(cfg);
-	if (!ff.path) {
-		ui.notify(
-			"ffmpeg not found. Install system ffmpeg (winget install Gyan.FFmpeg) or reinstall this package (bundles ffmpeg-static).",
-			"error",
-		);
-		return;
-	}
-
-	const vs = voiceSettings(cfg);
-	let device = vs.device;
-
-	if (process.platform === "win32") {
-		// Never use "default" — dshow requires the exact device name
-		const mic = await ensureWindowsMic(ui, cfg, ff.path, false);
-		if (!mic) return;
-		device = mic;
-	}
-
-	const outPath = join(outputDirOf(cfg), `voice-${stamp()}.wav`);
-	ui.notify(`Recording ${vs.durationSec}s… speak now`, "info");
-	const rec = await recordMicrophone({
-		ffmpegPath: ff.path,
-		seconds: vs.durationSec,
-		device,
-		outPath,
-	});
-	if (!rec.ok) {
-		// If device vanished, force re-pick next time
-		if (process.platform === "win32" && /Could not find audio/i.test(rec.error)) {
-			const cur = loadRaw();
-			const voice = { ...(cur.voice || {}) };
-			delete voice.device;
-			writeFileSync(CONFIG_PATH, JSON.stringify({ ...cur, voice }, null, 2));
-			ui.notify(`${rec.error} Device cleared — press Ctrl+Shift+V again to pick a mic.`, "error");
-		} else {
-			ui.notify(rec.error, "error");
-		}
-		return;
-	}
-
-	ui.notify("Transcribing…", "info");
-	const tr = await transcribeFile(cfg, outPath);
-	try {
-		unlinkSync(outPath);
-	} catch {
-		/* keep on failure */
-	}
-
-	if (!tr.ok) {
-		ui.notify(tr.error, "error");
-		return;
-	}
-	if (!tr.text) {
-		ui.notify("No speech detected", "warning");
-		return;
-	}
-
-	const mode = voiceSettings(loadRaw()).mode;
-	if (mode === "append") {
-		const cur = ui.getEditorText?.() ?? "";
-		const next = cur ? (cur.endsWith("\n") || cur.endsWith(" ") ? cur + tr.text : cur + " " + tr.text) : tr.text;
-		ui.setEditorText(next);
-	} else {
-		ui.setEditorText(tr.text);
-	}
-	ui.notify(`Voice → editor (${tr.model})`, "info");
-}
-
-// ── Clean TUI ───────────────────────────────────────────────────
-
-function padLabel(label: string, width: number): string {
-	if (label.length >= width) return label.slice(0, width);
-	return label + " ".repeat(width - label.length);
-}
+// ── TUI ─────────────────────────────────────────────────────────
 
 function capRow(cfg: ToolsConfigSlice, cap: CapDef): string {
 	const st = getCapState(cfg, cap);
 	const n = modelsForCap(cfg, cap).length;
 	const status = st.enabled ? "On " : "Off";
 	const model = st.enabled ? shortModel(st.model || modelsForCap(cfg, cap)[0]?.id) : "—";
-	// Fixed columns for a clean list
 	return `${padLabel(cap.label, 18)}  ${status}  ${padLabel(model, 34)}  ${n ? n + " models" : "no models"}`;
 }
 
@@ -839,7 +413,6 @@ async function pickModel(
 	const pick = await ui.select(`${cap.label} — default model`, items);
 	if (!pick || pick === "Back") return undefined;
 	if (pick.startsWith("Use first")) return "";
-	// rows: "* id" or "  id" optionally followed by "  Name"
 	return pick.replace(/^\*\s/, "").replace(/^\s\s/, "").split(/\s{2,}/)[0].trim();
 }
 
@@ -895,87 +468,13 @@ async function configureCap(
 	}
 }
 
-async function configureVoice(
-	ctx: ExtensionContext,
-	cfg: ToolsConfigSlice,
-): Promise<ToolsConfigSlice> {
-	const ui = ctx.ui;
-	while (true) {
-		const vs = voiceSettings(cfg);
-		const sttOn = getCapState(cfg, CAPS.find((c) => c.id === "stt")!).enabled;
-		const ff = resolveFfmpeg(cfg);
-		const choice = await ui.select("Voice input", [
-			`Shortcut: ${VOICE_SHORTCUT}${sttOn ? "" : "  (disabled — STT is off)"}`,
-			`Duration: ${vs.durationSec}s`,
-			`Editor: ${vs.mode === "append" ? "append" : "replace"}`,
-			`Microphone: ${vs.device || "(auto)"}`,
-			`ffmpeg: ${ff.path ? `${ff.source} — ${shortModel(ff.path, 40)}` : "NOT FOUND"}`,
-			"Set ffmpeg path",
-			"Refresh audio devices",
-			"Test record → editor",
-			"Back",
-		]);
-		if (!choice || choice === "Back") return cfg;
-
-		if (choice.startsWith("Duration")) {
-			const raw = await ui.input("Recording length (seconds, 3–60)", String(vs.durationSec));
-			const n = Number(raw);
-			if (Number.isFinite(n)) {
-				cfg = saveRaw({ voice: { durationSec: Math.min(60, Math.max(3, Math.round(n))) } });
-			}
-			continue;
-		}
-
-		if (choice.startsWith("Editor")) {
-			const mode = await ui.select("After transcription", ["Replace editor text", "Append to editor", "Back"]);
-			if (!mode || mode === "Back") continue;
-			cfg = saveRaw({ voice: { mode: mode.startsWith("Append") ? "append" : "replace" } });
-			continue;
-		}
-
-		if (choice.startsWith("Microphone") || choice === "Refresh audio devices") {
-			const ff2 = resolveFfmpeg(cfg);
-			if (!ff2.path) {
-				ui.notify("Install ffmpeg first", "error");
-				continue;
-			}
-			if (process.platform !== "win32") {
-				ui.notify("Device picker is for Windows dshow. macOS/Linux use system default.", "info");
-				continue;
-			}
-			const mic = await ensureWindowsMic(ctx, cfg, ff2.path, true);
-			cfg = loadRaw();
-			if (mic) ui.notify(`Microphone: ${mic}`, "info");
-			continue;
-		}
-
-		if (choice === "Set ffmpeg path") {
-			const p = await ui.input("Absolute path to ffmpeg binary", cfg.ffmpegPath || ff.path || "");
-			if (p?.trim()) {
-				if (!existsSync(p.trim())) ui.notify("Path does not exist", "error");
-				else cfg = saveRaw({ ffmpegPath: p.trim() });
-			}
-			continue;
-		}
-
-		if (choice === "Test record → editor") {
-			await runVoiceToEditor(ctx);
-			cfg = loadRaw();
-			continue;
-		}
-	}
-}
-
 async function showStatus(ui: ExtensionContext["ui"], cfg: ToolsConfigSlice): Promise<void> {
-	const ff = resolveFfmpeg(cfg);
 	const on = CAPS.filter((c) => getCapState(cfg, c).enabled).length;
 	const lines = [
 		`Endpoint     ${endpointOf(cfg)}`,
 		`Catalog      ${cfg.lastSync ? new Date(cfg.lastSync).toLocaleString() : "never synced"}`,
 		`Output       ${outputDirOf(cfg)}`,
 		`Tools on     ${on} / ${CAPS.length}`,
-		`ffmpeg       ${ff.path ? `${ff.source}: ${ff.path}` : "missing"}`,
-		`Voice        ${VOICE_SHORTCUT} · ${voiceSettings(cfg).durationSec}s · ${getCapState(cfg, CAPS.find((c) => c.id === "stt")!).enabled ? "armed" : "disarmed (STT off)"}`,
 		`Config       ${CONFIG_PATH}`,
 		"",
 		...CAPS.map((cap) => {
@@ -994,19 +493,13 @@ async function runToolsUI(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void
 	while (true) {
 		const header = cfg.catalog?.length
 			? `Synced · ${Object.entries(cfg.counts || {})
+					.filter(([k]) => k !== "stt")
 					.map(([k, v]) => `${k} ${v}`)
 					.join(" · ")}`
 			: "Catalog empty — run /9router → Sync models";
 
 		const rows = CAPS.map((c) => capRow(cfg, c));
-		const menu = [
-			...rows,
-			"─".repeat(48),
-			"Output folder",
-			"Voice input",
-			"Status",
-			"Close",
-		];
+		const menu = [...rows, "─".repeat(48), "Output folder", "Status", "Close"];
 
 		const choice = await ui.select(`9Router Tools\n${header}`, menu);
 		if (!choice || choice === "Close") break;
@@ -1021,20 +514,13 @@ async function runToolsUI(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void
 			continue;
 		}
 
-		if (choice === "Voice input") {
-			cfg = await configureVoice(ctx, cfg);
-			continue;
-		}
-
 		if (choice === "Status") {
 			await showStatus(ui, cfg);
 			continue;
 		}
 
 		const cap = CAPS.find((c) => choice.startsWith(padLabel(c.label, 18)) || choice.includes(c.label));
-		if (cap) {
-			cfg = await configureCap(pi, ui, cfg, cap);
-		}
+		if (cap) cfg = await configureCap(pi, ui, cfg, cap);
 	}
 }
 
@@ -1225,54 +711,6 @@ function registerTtsTool(pi: ExtensionAPI) {
 		renderResult(result, { expanded }, theme) {
 			const d = (result.details || {}) as { file?: string };
 			return compactResult("nr_tts", d.file ? basename(d.file) : "", theme, expanded, textFromResult(result));
-		},
-	});
-}
-
-function registerSttTool(pi: ExtensionAPI) {
-	const cap = CAPS.find((c) => c.id === "stt")!;
-	pi.registerTool({
-		name: cap.tool,
-		label: cap.label,
-		description:
-			"Transcribe an existing audio file via 9Router (Whisper/Groq/Gemini/…). Pass a local filesystem path. For live microphone input into the pi editor, the user uses Ctrl+Shift+V (not this tool).",
-		promptSnippet: "Transcribe audio file via 9Router",
-		promptGuidelines: [
-			"Use nr_stt to transcribe an audio file on disk (mp3, wav, m4a, webm, ogg, flac).",
-			"Pass file as a real path relative to the project or absolute. Strip a leading @ if present.",
-			"Optional: language (ISO-639-1), prompt (vocabulary hint), response_format (json|text|verbose_json|srt|vtt).",
-			"Do not use nr_stt for live mic capture; tell the user to press Ctrl+Shift+V when STT is enabled in /9router-tools.",
-		],
-		parameters: Type.Object({
-			file: Type.String({ description: "Path to audio file" }),
-			model: Type.Optional(Type.String({ description: "Override default STT model" })),
-			language: Type.Optional(Type.String({ description: "ISO-639-1 e.g. en, vi" })),
-			prompt: Type.Optional(Type.String({ description: "Optional vocabulary hint" })),
-			response_format: Type.Optional(Type.String({ description: "json | text | verbose_json | srt | vtt" })),
-		}),
-		async execute(_id, params, signal, onUpdate, ctx) {
-			const cfg = loadRaw();
-			const blocked = needCap(cfg, cap);
-			if (blocked) return toolError(blocked);
-			const filePath = resolveUserPath(params.file, ctx.cwd);
-			onUpdate?.({ content: [{ type: "text", text: "Transcribing…" }] });
-			const tr = await transcribeFile(
-				cfg,
-				filePath,
-				{
-					model: params.model,
-					language: params.language,
-					prompt: params.prompt,
-					response_format: params.response_format,
-				},
-				signal,
-			);
-			if (!tr.ok) return toolError(tr.error, { file: filePath });
-			return toolOk(tr.text, { model: tr.model, file: filePath });
-		},
-		renderResult(result, { expanded }, theme) {
-			const d = (result.details || {}) as { file?: string };
-			return compactResult("nr_stt", d.file ? basename(d.file) : "", theme, expanded, textFromResult(result));
 		},
 	});
 }
@@ -1492,7 +930,6 @@ function registerWebFetchTool(pi: ExtensionAPI) {
 export default function (pi: ExtensionAPI) {
 	registerImageTool(pi);
 	registerTtsTool(pi);
-	registerSttTool(pi);
 	registerEmbedTool(pi);
 	registerWebSearchTool(pi);
 	registerWebFetchTool(pi);
@@ -1500,33 +937,22 @@ export default function (pi: ExtensionAPI) {
 	const applyFromDisk = () => applyToolActivation(pi, loadRaw());
 
 	pi.on("session_start", async (_event, ctx) => {
+		// Persist once to strip legacy stt/voice/ffmpeg keys from older installs
+		const cfg = saveRaw({});
 		applyFromDisk();
-		const cfg = loadRaw();
 		const enabled = CAPS.filter((c) => getCapState(cfg, c).enabled).length;
 		if (ctx.hasUI) {
-			const ff = resolveFfmpeg(cfg);
-			const sttOn = getCapState(cfg, CAPS.find((c) => c.id === "stt")!).enabled;
-			const voice = sttOn && ff.path ? ` · ${VOICE_SHORTCUT}` : "";
 			ctx.ui.setStatus(
 				"9router-tools",
-				ctx.ui.theme.fg("dim", `tools ${enabled}/${CAPS.length}${voice}`),
+				ctx.ui.theme.fg("dim", `tools ${enabled}/${CAPS.length}`),
 			);
 		}
 	});
 
 	pi.events.on("9router:synced", () => applyFromDisk());
 
-	// Voice → editor. Registered always; handler no-ops when STT is off.
-	pi.registerShortcut(VOICE_SHORTCUT, {
-		description: "Voice input (9Router STT → editor). Requires Speech to text On.",
-		handler: async (ctx) => {
-			if (!ctx.hasUI) return;
-			await runVoiceToEditor(ctx);
-		},
-	});
-
 	pi.registerCommand("9router-tools", {
-		description: "9Router tools settings: enable capabilities, defaults, voice input, output folder",
+		description: "9Router tools settings: enable capabilities, default models, output folder",
 		handler: async (_args, ctx) => {
 			if (!ctx.hasUI && ctx.mode !== "tui") {
 				ctx.ui.notify("/9router-tools needs interactive mode", "error");

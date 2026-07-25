@@ -1,65 +1,91 @@
 # Usage
 
-## `/9router` — connection & chat models
+## `/9router` — connection & chat
 
-Clean main menu:
+| Menu item | What it does |
+|-----------|----------------|
+| **Sync models** | Fetch catalogs from 9Router; register chat models as provider `9router` |
+| **Connection** | Edit endpoint, API key, test health + `/v1/models`, clear key |
+| **Browse catalog** | Page through chat / image / tts / embedding / web / … |
+| **Status** | Endpoint, key mask, sync time, counts |
+| **Unregister chat models** | Remove registered chat models from pi |
+| **Close** | Exit menu |
 
-| Item | Action |
-|------|--------|
-| **Sync models** | Fetch all catalogs; register chat models as provider `9router` |
-| **Connection** | Endpoint, API key, test, clear key |
-| **Browse catalog** | chat / image / tts / stt / web / … |
-| **Status** | Full summary |
-| **Unregister chat models** | Drop provider models |
+### After sync
 
-After sync: **`/model`** → **9router**.
+- Open **`/model`**  
+- Select provider **9router**  
+- Chat goes to `{endpoint}/v1/chat/completions` with the chosen model id (e.g. `kr/claude-sonnet-4.5`)
 
-## `/9router-tools` — capabilities
+Re-run **Sync models** when you add/remove providers in the 9Router dashboard.
 
-Main list is columnar (no emoji soup):
+---
 
+## `/9router-tools` — non-chat capabilities
+
+| Menu item | What it does |
+|-----------|----------------|
+| **Capability rows** | Select → turn on/off, set default model, browse models |
+| **Output folder** | Where images and TTS audio files are written |
+| **Status** | Summary of tools and defaults |
+| **Close** | Exit menu |
+
+### Tools
+
+| Tool | When the model should use it |
+|------|------------------------------|
+| `nr_image_generate` | User wants an image, icon, logo, illustration, mockup |
+| `nr_tts` | User wants spoken audio / voiceover from text (saves a file) |
+| `nr_embed` | Embeddings / vectors / RAG (off by default) |
+| `nr_web_search` | Live web search |
+| `nr_web_fetch` | Full content for a known URL |
+
+### On vs off
+
+| State | Model context |
+|-------|----------------|
+| **On** | Tool schema + short usage guidelines in the system prompt; tool is callable |
+| **Off** | Tool not active; **no** guidelines or schema for that tool |
+
+Defaults are set per capability under **Default model**. If unset, the first catalog entry for that kind is used.
+
+---
+
+## Typical workflow
+
+```text
+/9router          → Sync models
+/model            → 9router / your-chat-model
+/9router-tools    → turn on web search + image if needed
 ```
-Image generation    On   gemini/…preview          6 models
-Text to speech      On   openrouter/openai/…      8 models
-Speech to text      On   groq/whisper-…           4 models
-…
-Output folder
-Voice input
-Status
-Close
-```
 
-Select a row → **Turn on/off**, **Default model**, **Browse models**.
+Ask the agent normally:
 
-### Voice input (settings only — no extra slash command)
+- “Search for the latest Exa API search parameters” → `nr_web_search`  
+- “Generate a simple app icon…” → `nr_image_generate`  
+- “Read this URL as markdown: https://…” → `nr_web_fetch`  
 
-| Setting | Meaning |
-|---------|---------|
-| Shortcut | `Ctrl+Shift+V` (always registered; **no-ops if STT is Off**) |
-| Duration | 3–60 seconds (default 8) |
-| Editor | replace or append transcribed text |
-| Microphone | Windows dshow device (auto-pick / list) |
-| ffmpeg | PATH, `ffmpeg-static`, config path, or `FFMPEG_PATH` |
+---
 
-Flow: press shortcut → record → STT via 9Router → text in the editor.
+## What is not included
 
-## Model context (on vs off)
+| Feature | Status |
+|---------|--------|
+| Speech-to-text / mic → editor | **Not in this package** — use Superwhisper, Spokenly, etc. |
+| Video generation | Not exposed (no public `/v1/models/video` catalog) |
 
-When a capability is **On**:
+---
 
-- Tool is in `setActiveTools`
-- Model sees tool schema + `promptSnippet` + `promptGuidelines`
+## Config reference
 
-When **Off**:
+File: `~/.pi/agent/9router.json`
 
-- Tool removed from active set
-- **No** snippet/guidelines for that tool in the system prompt
-
-## Typical loop
-
-```
-/9router        → Sync models
-/9router-tools  → defaults + voice mic
-Ctrl+Shift+V    → speak a prompt into the editor
-Enter           → send to the agent
-```
+| Field | Owner | Meaning |
+|-------|--------|---------|
+| `endpoint` | `/9router` | 9Router base URL (no `/v1`) |
+| `apiKey` | `/9router` | Bearer key (optional if auth off) |
+| `catalog` | sync | Last full model list |
+| `chatModels` | sync | Models registered with pi |
+| `counts` | sync | Per-kind counts |
+| `capabilities` | `/9router-tools` | `{ image, tts, embed, web_search, web_fetch }` → `enabled` + `model` |
+| `outputDir` | `/9router-tools` | Generated files directory |

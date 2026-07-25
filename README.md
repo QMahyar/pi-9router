@@ -1,15 +1,14 @@
 # pi-9router
 
-[Pi](https://pi.dev) extensions for **[9Router](https://github.com/decolua/9router)**.
+[Pi](https://pi.dev) extensions for **[9Router](https://github.com/decolua/9router)** — one local gateway, many providers.
 
-| Command | Role |
-|---------|------|
-| **`/9router`** | Endpoint, API key, **sync catalogs**, register **chat** models |
-| **`/9router-tools`** | Enable tools, default models, output folder, **voice input** |
+| Command | Purpose |
+|---------|---------|
+| **`/9router`** | Connect to 9Router, sync model catalogs, register **chat** models in pi |
+| **`/9router-tools`** | Turn non-chat tools on/off, pick default models, set output folder |
 
-| Shortcut | Role |
-|----------|------|
-| **`Ctrl+Shift+V`** | Mic → STT → editor text (only when **Speech to text** is On) |
+> **Speech-to-text / dictation is not part of this package.**  
+> Use a dedicated app (e.g. [Superwhisper](https://superwhisper.com), Spokenly, or OS dictation) to put voice into the editor. That keeps pi’s shortcut keys free and avoids fragile mic capture in the terminal.
 
 ## Install
 
@@ -17,47 +16,136 @@
 pi install git:github.com/QMahyar/pi-9router
 ```
 
-This package depends on **`ffmpeg-static`** for voice recording when system ffmpeg is missing.  
-`postinstall` checks for ffmpeg (PATH or bundled) and prints setup hints if neither is found.
+Requires a running 9Router instance (default `http://localhost:20128`).
 
-You already have system ffmpeg? That is preferred automatically.
+```bash
+npm install -g 9router
+9router
+```
 
 ## Quick start
 
-1. Run 9Router (`9router` → port **20128**)
-2. **`/9router`** → **Sync models**
-3. **`/model`** → provider **9router**
-4. **`/9router-tools`** → turn capabilities on/off, set defaults
-5. Optional: **Voice input** row → duration / mic / test via **Ctrl+Shift+V**
+1. Start 9Router  
+2. In pi: **`/9router`** → **Sync models**  
+3. **`/model`** → provider **9router** (chat)  
+4. **`/9router-tools`** → enable tools and set defaults  
 
-## Tools (model-facing)
+## Architecture
 
-Only **On** tools appear in the model context (schema + guidelines). **Off** tools are removed from the active tool list.
+```
+┌─────────────┐   OpenAI-compatible HTTP    ┌──────────────┐
+│     pi      │ ──────────────────────────► │   9Router    │
+│             │   /v1/chat/completions      │  :20128      │
+│  extensions │   /v1/images/generations    │              │
+│             │   /v1/audio/speech          │  → providers │
+│             │   /v1/embeddings            │              │
+│             │   /v1/search  /v1/web/fetch │              │
+└─────────────┘                             └──────────────┘
+       │
+       ▼
+ ~/.pi/agent/9router.json
+```
 
-| Tool | Default | API |
-|------|---------|-----|
-| `nr_image_generate` | On | `/v1/images/generations` |
-| `nr_tts` | On | `/v1/audio/speech` |
-| `nr_stt` | On | `/v1/audio/transcriptions` (file path) |
-| `nr_embed` | Off | `/v1/embeddings` |
-| `nr_web_search` | On | `/v1/search` |
-| `nr_web_fetch` | On | `/v1/web/fetch` |
+| Extension | File | Responsibility |
+|-----------|------|----------------|
+| Core | `extensions/9router.ts` | Endpoint, API key, catalog sync, `registerProvider("9router")` for chat |
+| Tools | `extensions/9router-tools.ts` | LLM tools + `/9router-tools` settings UI |
 
-Live mic is **not** an LLM tool — it is **Ctrl+Shift+V** → editor.
+Both share **`~/.pi/agent/9router.json`**.
+
+## Chat models (`/9router`)
+
+**Sync models** pulls:
+
+| Kind | Endpoint |
+|------|----------|
+| chat | `GET /v1/models` |
+| image | `GET /v1/models/image` |
+| tts | `GET /v1/models/tts` |
+| embedding | `GET /v1/models/embedding` |
+| web | `GET /v1/models/web` |
+| … | plus stt / image-to-text for browsing only |
+
+Only **chat** models are registered with pi’s model picker (`provider: 9router`, `api: openai-completions`, `baseUrl: {endpoint}/v1`), using each model’s `capabilities` (context window, vision, reasoning, …).
+
+Menu:
+
+```
+Sync models
+Connection          # endpoint, API key, test
+Browse catalog
+Status
+Unregister chat models
+Close
+```
+
+## Tools (`/9router-tools`)
+
+| Tool | Default | 9Router API | Use for |
+|------|---------|-------------|---------|
+| `nr_image_generate` | On | `POST /v1/images/generations` | Icons, illustrations, mockups |
+| `nr_tts` | On | `POST /v1/audio/speech` | Narration → audio file |
+| `nr_embed` | Off | `POST /v1/embeddings` | RAG / vectors |
+| `nr_web_search` | On | `POST /v1/search` | Live web search |
+| `nr_web_fetch` | On | `POST /v1/web/fetch` | URL → markdown |
+
+### On vs off (model context)
+
+When a tool is **On**:
+
+- It is in pi’s active tool list  
+- The model sees its **schema**, **promptSnippet**, and **promptGuidelines**
+
+When **Off**:
+
+- Removed via `setActiveTools`  
+- **Nothing** about that tool is injected into the system prompt  
+
+Settings list (columnar):
+
+```
+Image generation    On   model-id…          N models
+Text to speech      On   …
+Embeddings          Off  —
+Web search          On   …
+Web fetch           On   …
+────────────────
+Output folder
+Status
+Close
+```
+
+Generated files go to `~/.pi/agent/9router-output/` (configurable).
 
 ## Config
 
-`~/.pi/agent/9router.json` — shared by both extensions.
+`~/.pi/agent/9router.json` (example):
 
-Outputs default to `~/.pi/agent/9router-output/`.
+```json
+{
+  "endpoint": "http://localhost:20128",
+  "apiKey": "sk-…",
+  "lastSync": "2026-07-25T12:00:00.000Z",
+  "chatModels": [],
+  "catalog": [],
+  "counts": { "chat": 95, "image": 6, "tts": 8, "embedding": 13, "web": 2 },
+  "capabilities": {
+    "image": { "enabled": true, "model": "gemini/gemini-3-pro-image-preview" },
+    "web_search": { "enabled": true, "model": "exa/search" }
+  },
+  "outputDir": "C:/Users/you/.pi/agent/9router-output"
+}
+```
 
-Env: `NINEROUTER_URL`, `NINEROUTER_KEY`, optional `FFMPEG_PATH`.
+Environment fallbacks: `NINEROUTER_URL`, `NINEROUTER_KEY`.
 
 ## Docs
 
-- [docs/setup.md](docs/setup.md)
-- [docs/usage.md](docs/usage.md)
-- [docs/dev.md](docs/dev.md)
+| Doc | Contents |
+|-----|----------|
+| [docs/setup.md](docs/setup.md) | Install, first run |
+| [docs/usage.md](docs/usage.md) | Menus, tools, on/off behavior |
+| [docs/dev.md](docs/dev.md) | Extension layout for contributors |
 
 ## License
 

@@ -5,8 +5,9 @@
  *
  * Chat models are registered as provider "9router" via pi.registerProvider()
  * using metadata from GET /v1/models (capabilities.contextWindow, vision, …).
- * Image / TTS / STT / embedding / web catalogs are fetched and stored for browse,
- * but only chat (LLM) models are registered with pi's model picker.
+ * Image / TTS / embedding / web catalogs are fetched and stored for browse
+ * (and for /9router-tools). Only chat (LLM) models are registered with pi's model picker.
+ * STT catalog may still appear under Browse; this package does not expose STT tools.
  *
  * Config: ~/.pi/agent/9router.json
  * Env:    NINEROUTER_URL, NINEROUTER_KEY
