@@ -1,64 +1,56 @@
 # Usage
 
-## `/9router` menu
+## `/9router` — core (chat models)
 
 | Item | Description |
 |------|-------------|
-| **Status** | Endpoint, masked key, last sync, model counts |
-| **Set endpoint** | Base URL without `/v1` |
-| **Set / Clear API key** | Stored in `~/.pi/agent/9router.json` |
-| **Test connection** | `GET /api/health` + `GET /v1/models` |
-| **Fetch all & register chat models** | Pull all catalogs; register LLM models with pi |
-| **Browse catalog** | Page through chat / image / tts / stt / … |
-| **Unregister chat models** | `unregisterProvider("9router")` + clear cache |
+| **Status** | Endpoint, key, last sync, counts |
+| **Set endpoint / API key** | Connection settings |
+| **Test connection** | Health + chat list |
+| **Fetch all & register chat models** | Pull all catalogs; register LLMs as provider `9router` |
+| **Browse catalog** | All kinds including image/tts/stt/web |
+| **Unregister** | Remove chat models from pi |
 
-## What gets registered
+After sync, open **`/model`** → provider **9router**.
 
-Only **chat** (LLM) models from `GET /v1/models` are added to pi’s model list.
+## `/9router-tools` — capabilities
 
-For each model, pi receives:
+| Item | Description |
+|------|-------------|
+| **☐/☑ each capability** | Enable or disable the matching tool |
+| **Set default model** | Pick from catalog for that capability |
+| **List models** | Show catalog entries |
+| **Set output directory** | Where images/audio are saved |
+| **Refresh tool activation** | Re-apply ON/OFF to pi’s active tool set |
 
-| Field | Source |
-|-------|--------|
-| `id` | `data[].id` (e.g. `gc/gemini-2.5-pro`) |
-| `name` | inferred / info endpoint |
-| `contextWindow` | `capabilities.contextWindow` (default 128000) |
-| `maxTokens` | `capabilities.maxOutput` |
-| `reasoning` | `capabilities.reasoning` or id heuristics (`thinking`, …) |
-| `input` | `["text","image"]` if `capabilities.vision` |
-| `compat` | mapped from `thinkingFormat` for OpenAI-compat gateway |
+### Tools exposed to the model
 
-Provider settings:
+| Tool | When to use |
+|------|-------------|
+| `nr_image_generate` | Icons, illustrations, mockups, symbols |
+| `nr_tts` | Narration / voice from text |
+| `nr_stt` | Transcribe a local audio file path |
+| `nr_embed` | Vectors for RAG (full vectors opt-in via `full: true`) |
+| `nr_web_search` | Live web search |
+| `nr_web_fetch` | URL → markdown/text |
 
-- **id:** `9router`
-- **api:** `openai-completions`
-- **baseUrl:** `{endpoint}/v1`
-- **authHeader:** Bearer key
+Disabled tools are removed from the active tool list (`setActiveTools`) so the LLM will not call them.
 
-## Catalog kinds (browse-only except chat)
+### Typical flow
 
-| Kind | 9Router path |
-|------|----------------|
-| chat | `/v1/models` |
-| image | `/v1/models/image` |
-| tts | `/v1/models/tts` |
-| stt | `/v1/models/stt` |
-| embedding | `/v1/models/embedding` |
-| web | `/v1/models/web` |
-| image-to-text | `/v1/models/image-to-text` |
+```
+/9router            → Fetch all & register
+/9router-tools      → Enable image + web_search, set defaults
+Ask: "Generate a simple app icon…"
+Ask: "Search for pi coding agent extensions"
+```
 
-## Re-sync after 9Router changes
+## Re-sync
 
-When you enable/disable providers or combos in the 9Router dashboard:
+When 9Router providers change:
 
 ```
 /9router → Fetch all & register chat models
 ```
 
-Cached models also load automatically on pi startup (no network). Re-fetch to refresh.
-
-## Tips
-
-- Combos (`owned_by: "combo"`) may lack full capabilities; the extension still registers them with safe defaults and may call `/v1/models/info` for sparse entries.
-- Costs are set to `0` — 9Router billing is outside pi.
-- After register, provider updates apply immediately (no `/reload` required for `registerProvider`).
+`9router-tools` listens for `9router:synced` and refreshes activation. Defaults you already set are kept.

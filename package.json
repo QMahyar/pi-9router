@@ -1,7 +1,7 @@
 {
   "name": "pi-9router",
-  "version": "1.0.0",
-  "description": "Pi extension: sync 9Router chat/image/tts/stt models into pi via /9router TUI",
+  "version": "1.1.0",
+  "description": "Pi extensions for 9Router: chat model sync + toggleable image/tts/stt/embed/web tools",
   "keywords": [
     "pi-package",
     "pi",

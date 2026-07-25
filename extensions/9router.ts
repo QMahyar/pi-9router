@@ -145,8 +145,17 @@ function loadConfig(): Config {
 function saveConfig(config: Config): void {
 	const dir = dirname(CONFIG_PATH);
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-	// Persist explicitly; do not echo env-only key unless user set it via TUI
-	const out: Config = {
+	// Merge so companion extensions (9router-tools) can store keys on the same file
+	// without being wiped (e.g. capabilities, defaults, outputDir).
+	let existing: Record<string, unknown> = {};
+	if (existsSync(CONFIG_PATH)) {
+		try {
+			existing = JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as Record<string, unknown>;
+		} catch {
+			existing = {};
+		}
+	}
+	const core: Config = {
 		endpoint: config.endpoint.replace(/\/$/, ""),
 		apiKey: config.apiKey,
 		lastSync: config.lastSync,
@@ -154,6 +163,7 @@ function saveConfig(config: Config): void {
 		catalog: config.catalog,
 		counts: config.counts,
 	};
+	const out = { ...existing, ...core };
 	writeFileSync(CONFIG_PATH, JSON.stringify(out, null, 2));
 }
 
@@ -789,12 +799,21 @@ async function runNineRouterUI(pi: ExtensionAPI, ctx: ExtensionContext): Promise
 			config = applySyncToConfig(config, sync);
 			registerWithPi(pi, config, sync.chatModels);
 
+			// Notify companion extensions (e.g. 9router-tools) that catalogs refreshed
+			pi.events.emit("9router:synced", {
+				endpoint: config.endpoint,
+				counts: sync.counts,
+				chatCount: sync.chatModels.length,
+				at: config.lastSync,
+			});
+
 			const summary = [
 				`Registered ${sync.chatModels.length} chat models as provider "${PROVIDER_ID}"`,
 				...Object.entries(sync.counts).map(([k, n]) => `  ${k}: ${n}`),
 				sync.error ? `Note: ${sync.error}` : "",
 				"",
 				"Open /model and select provider 9router (or search a model id).",
+				"Configure tools (image/tts/stt/…) with /9router-tools.",
 				"Changes apply immediately — /reload not required for provider update.",
 			]
 				.filter(Boolean)

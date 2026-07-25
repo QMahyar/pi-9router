@@ -4,52 +4,50 @@
 
 ```
 pi-9router/
-├── extensions/9router.ts   # extension (command + provider registration)
+├── extensions/
+│   ├── 9router.ts         # connection, catalog sync, chat provider
+│   └── 9router-tools.ts   # capability tools + /9router-tools TUI
 ├── docs/
-├── package.json            # pi package manifest
+├── package.json
 ├── README.md
 └── LICENSE
 ```
 
-## Architecture
+## Split of responsibility
 
 ```
-/9router TUI
-    │
-    ├─ config  →  ~/.pi/agent/9router.json
-    │
-    ├─ fetch   →  9Router REST
-    │               GET /api/health
-    │               GET /v1/models
-    │               GET /v1/models/{image,tts,stt,embedding,web,image-to-text}
-    │               GET /v1/models/info?id=…   (sparse enrich)
-    │
-    └─ register → pi.registerProvider("9router", {
-                     baseUrl: endpoint + "/v1",
-                     api: "openai-completions",
-                     models: [ …chat only… ]
-                  })
+9router.ts
+  config core: endpoint, apiKey, catalog, chatModels
+  registerProvider("9router", chat models)
+  emit pi.events "9router:synced"
+  saveConfig merges existing file (preserves capabilities/outputDir)
+
+9router-tools.ts
+  reads same ~/.pi/agent/9router.json
+  registers nr_* tools
+  capabilities[id].enabled + .model
+  setActiveTools to toggle
+  listens for 9router:synced
 ```
 
-Startup: if `chatModels` are cached in config, register them immediately (async factory not required for network).
+## Adding a capability
+
+1. Add a `CapDef` in `CAPS` (id, tool name, catalog filter).
+2. Implement `registerXTool(pi)`.
+3. Call it from the default export.
+4. Document in README / usage.
 
 ## Local test
 
 ```bash
-cp extensions/9router.ts ~/.pi/agent/extensions/9router.ts
+cp extensions/*.ts ~/.pi/agent/extensions/
 # in pi:
 /reload
 /9router
-```
-
-Or:
-
-```bash
-pi -e ./extensions/9router.ts
+/9router-tools
 ```
 
 ## References
 
 - 9Router skills: https://github.com/decolua/9router/tree/master/skills
-- Pi custom providers: `@earendil-works/pi-coding-agent` → `docs/custom-provider.md`
-- Pi models.json: `docs/models.md`
+- Pi tools / setActiveTools: coding-agent `docs/extensions.md`
