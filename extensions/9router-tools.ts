@@ -18,6 +18,11 @@
  * so a guessed name fails locally with the real ids rather than as an opaque
  * upstream routing error.
  *
+ * Note the wire convention differs per endpoint: /v1/images/generations,
+ * /v1/audio/speech and /v1/embeddings take the full catalog id, but /v1/search
+ * and /v1/web/fetch take a bare *provider* name ("exa", not "exa/search"). The
+ * catalog id is kept for display; only the request body is stripped.
+ *
  * Shared config: ~/.pi/agent/9router.json
  */
 
@@ -1005,9 +1010,13 @@ function registerWebSearchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			const picked = resolveModel(cfg, cap, params.model);
 			if (!picked.ok) return toolError(picked.message, { requested: params.model });
 			const model = picked.id;
-			onUpdate?.({ content: [{ type: "text", text: `Searching · ${model}` }] });
+			// 9Router /v1/search takes `model` as a *provider name* ("exa"), not the
+			// catalog id ("exa/search") — the suffixed form is rejected with
+			// "Unknown provider". Keep the catalog id for display and details.
+			const apiModel = model.replace(/\/search$/i, "");
+			onUpdate?.({ content: [{ type: "text", text: `Searching · ${apiModel}` }] });
 			const body: Record<string, unknown> = {
-				model,
+				model: apiModel,
 				query: params.query,
 				max_results: params.max_results ?? 5,
 			};
@@ -1084,10 +1093,14 @@ function registerWebFetchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			const picked = resolveModel(cfg, cap, params.model);
 			if (!picked.ok) return toolError(picked.message, { requested: params.model });
 			const model = picked.id;
+			// 9Router /v1/web/fetch takes `model` as a *provider name* ("exa"), not the
+			// catalog id ("exa/fetch") — the suffixed form is rejected with
+			// "Unknown provider". Keep the catalog id for display and details.
+			const apiModel = model.replace(/\/fetch$/i, "");
 			if (!/^https?:\/\//i.test(params.url)) return toolError("url must be absolute http(s)");
 			onUpdate?.({ content: [{ type: "text", text: `Fetching · ${params.url}` }] });
 			const body: Record<string, unknown> = {
-				model,
+				model: apiModel,
 				url: params.url,
 				format: params.format || "markdown",
 			};

@@ -24,6 +24,13 @@ proxy, and listing dead models is worse than omitting them.
 **Tool descriptions** embed the catalog ids, so `registerAll()` re-runs on
 `9router:synced`; `registerTool` keys on tool name, so re-registering replaces cleanly.
 
+**`model` on the wire is not always the catalog id.** `/v1/images/generations`,
+`/v1/audio/speech` and `/v1/embeddings` take the full id (`nb/nanobanana-flash`), but
+`/v1/search` and `/v1/web/fetch` take a bare provider name — `exa`, not `exa/search`,
+which the server rejects with `Unknown provider`. The upstream skill doc puts it as
+"Provider IS the model". The tools strip the `/search` / `/fetch` suffix from the request
+body only, keeping the catalog id for display and `details`.
+
 Exported for testing: `fetchAllAndBuild`, `resolveModel`, `describeModels`, `CAPS`.
 
 Publish: `npm publish --access public` from package root (name `@qmahyar/pi-9router`).
