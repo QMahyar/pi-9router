@@ -1,0 +1,27 @@
+{
+  "name": "pi-9router",
+  "version": "1.0.0",
+  "description": "Pi extension: sync 9Router chat/image/tts/stt models into pi via /9router TUI",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "extension",
+    "9router",
+    "ninerouter",
+    "models",
+    "openai-compatible"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/QMahyar/pi-9router.git"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
