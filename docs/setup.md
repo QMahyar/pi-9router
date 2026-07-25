@@ -1,8 +1,6 @@
 # Setup
 
-## Prerequisites
-
-1. **9Router** running:
+## 1. 9Router
 
 ```bash
 npm install -g 9router
@@ -10,28 +8,37 @@ npm install -g 9router
 curl http://localhost:20128/api/health
 ```
 
-2. **Pi package**:
+## 2. This package
 
 ```bash
 pi install git:github.com/QMahyar/pi-9router
 ```
 
-Both extensions load from the package (`extensions/9router.ts` + `extensions/9router-tools.ts`).
+Installs extensions + **`ffmpeg-static`**. `postinstall` reports whether ffmpeg was found.
 
-## First-time
+### ffmpeg (voice input)
 
-1. `/9router` → endpoint (default `http://localhost:20128`) → API key if required  
-2. **Fetch all & register chat models**  
-3. `/9router-tools` → toggle capabilities / pick default models  
-4. `/model` → provider **9router** for chat  
+Resolution order:
 
-## Environment
+1. `ffmpegPath` in `~/.pi/agent/9router.json` (set in /9router-tools → Voice input)
+2. `FFMPEG_PATH` or `FFMPEG_BINARY` env
+3. `ffmpeg` on **PATH**
+4. Bundled **`ffmpeg-static`**
 
-| Variable | Purpose |
-|----------|---------|
-| `NINEROUTER_URL` | Default endpoint |
-| `NINEROUTER_KEY` | API key fallback |
+If none work, Ctrl+Shift+V shows an error. System install examples:
+
+```bash
+winget install Gyan.FFmpeg
+brew install ffmpeg
+sudo apt install ffmpeg
+```
+
+## 3. First run in pi
+
+1. `/9router` → **Connection** (if needed) → **Sync models**
+2. `/9router-tools` → enable tools / set defaults
+3. Voice: **Voice input** → pick mic (Windows) → **Ctrl+Shift+V**
 
 ## Avoid double-loading
 
-Use **either** `pi install git:…` **or** copies under `~/.pi/agent/extensions/`, not both.
+Use either `pi install` **or** copies in `~/.pi/agent/extensions/`, not both.

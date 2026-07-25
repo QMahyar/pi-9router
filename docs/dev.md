@@ -3,51 +3,28 @@
 ## Layout
 
 ```
-pi-9router/
-├── extensions/
-│   ├── 9router.ts         # connection, catalog sync, chat provider
-│   └── 9router-tools.ts   # capability tools + /9router-tools TUI
-├── docs/
-├── package.json
-├── README.md
-└── LICENSE
+extensions/
+  9router.ts         # /9router — sync + chat provider
+  9router-tools.ts   # /9router-tools + Ctrl+Shift+V + nr_* tools
+scripts/
+  check-ffmpeg.cjs   # postinstall hint
 ```
 
-## Split of responsibility
+## UI conventions
 
-```
-9router.ts
-  config core: endpoint, apiKey, catalog, chatModels
-  registerProvider("9router", chat models)
-  emit pi.events "9router:synced"
-  saveConfig merges existing file (preserves capabilities/outputDir)
+- Prefer plain labels (`Sync models`, `Turn on`) over emoji-heavy rows
+- Column-aligned capability list in `/9router-tools`
+- Nested **Connection** / **Voice input** submenus keep the root short
 
-9router-tools.ts
-  reads same ~/.pi/agent/9router.json
-  registers nr_* tools
-  capabilities[id].enabled + .model
-  setActiveTools to toggle
-  listens for 9router:synced
-```
+## Voice shortcut
 
-## Adding a capability
+`pi.registerShortcut("ctrl+shift+v")` is always registered.  
+Handler checks STT `enabled` and returns a notify if off — no separate `/voice` command.
 
-1. Add a `CapDef` in `CAPS` (id, tool name, catalog filter).
-2. Implement `registerXTool(pi)`.
-3. Call it from the default export.
-4. Document in README / usage.
+## ffmpeg
 
-## Local test
+`resolveFfmpeg()` searches config → env → PATH → `ffmpeg-static` (walk package roots under `~/.pi`).
 
-```bash
-cp extensions/*.ts ~/.pi/agent/extensions/
-# in pi:
-/reload
-/9router
-/9router-tools
-```
+## Events
 
-## References
-
-- 9Router skills: https://github.com/decolua/9router/tree/master/skills
-- Pi tools / setActiveTools: coding-agent `docs/extensions.md`
+`9router.ts` emits `9router:synced` after catalog refresh; tools re-apply activation.

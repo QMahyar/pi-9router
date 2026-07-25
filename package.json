@@ -1,7 +1,7 @@
 {
   "name": "pi-9router",
-  "version": "1.1.0",
-  "description": "Pi extensions for 9Router: chat model sync + toggleable image/tts/stt/embed/web tools",
+  "version": "1.2.0",
+  "description": "Pi extensions for 9Router: chat model sync + toggleable image/tts/stt/embed/web tools + voice input",
   "keywords": [
     "pi-package",
     "pi",
@@ -9,7 +9,10 @@
     "9router",
     "ninerouter",
     "models",
-    "openai-compatible"
+    "openai-compatible",
+    "tts",
+    "stt",
+    "image"
   ],
   "license": "MIT",
   "repository": {
@@ -20,6 +23,12 @@
     "extensions": [
       "./extensions"
     ]
+  },
+  "scripts": {
+    "postinstall": "node scripts/check-ffmpeg.cjs"
+  },
+  "dependencies": {
+    "ffmpeg-static": "^5.2.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"

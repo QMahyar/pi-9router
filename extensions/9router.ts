@@ -708,86 +708,95 @@ async function runNineRouterUI(pi: ExtensionAPI, ctx: ExtensionContext): Promise
 	let config = loadConfig();
 
 	while (true) {
+		const chatN = config.chatModels?.length ?? 0;
+		const synced = config.lastSync ? new Date(config.lastSync).toLocaleString() : "never";
+		const header = [
+			`Endpoint  ${config.endpoint}`,
+			`Key       ${config.apiKey ? maskedKey(config.apiKey) : process.env.NINEROUTER_KEY ? maskedKey(process.env.NINEROUTER_KEY) + " (env)" : "not set"}`,
+			`Chat      ${chatN} registered · last sync ${synced}`,
+		].join("\n");
+
 		const menu = [
-			"📡 Status",
-			"🔗 Set endpoint",
-			"🔑 Set API key",
-			"🧹 Clear API key",
-			"🩺 Test connection",
-			"⬇ Fetch all & register chat models",
-			"📚 Browse catalog",
-			"✕ Unregister chat models",
-			"Done",
+			"Sync models",
+			"Connection",
+			"Browse catalog",
+			"Status",
+			"Unregister chat models",
+			"Close",
 		];
 
-		const choice = await ui.select("9Router", menu);
-		if (!choice || choice === "Done") break;
+		const choice = await ui.select(`9Router\n${header}`, menu);
+		if (!choice || choice === "Close") break;
 
-		if (choice.startsWith("📡")) {
-			await ui.confirm("9Router status", statusLines(config).join("\n") + "\n\n(OK to close)");
+		if (choice === "Status") {
+			await ui.confirm("Status", statusLines(config).join("\n"));
 			continue;
 		}
 
-		if (choice.startsWith("🔗")) {
-			const next = await ui.input(
-				"9Router base URL (no /v1)",
-				config.endpoint || DEFAULT_ENDPOINT,
-			);
-			if (next?.trim()) {
-				config = { ...config, endpoint: next.trim().replace(/\/$/, "") };
-				saveConfig(config);
-				// Re-register with new base if we have models
-				if (config.chatModels?.length) {
-					registerWithPi(pi, config, config.chatModels);
-					ui.notify("Endpoint saved — provider baseUrl updated", "info");
-				} else {
-					ui.notify("Endpoint saved", "info");
+		if (choice === "Connection") {
+			while (true) {
+				const sub = await ui.select("Connection", [
+					`Endpoint: ${config.endpoint}`,
+					`API key: ${config.apiKey ? maskedKey(config.apiKey) : process.env.NINEROUTER_KEY ? "env NINEROUTER_KEY" : "not set"}`,
+					"Test connection",
+					"Clear API key",
+					"Back",
+				]);
+				if (!sub || sub === "Back") break;
+
+				if (sub.startsWith("Endpoint")) {
+					const next = await ui.input("Base URL (no /v1)", config.endpoint || DEFAULT_ENDPOINT);
+					if (next?.trim()) {
+						config = { ...config, endpoint: next.trim().replace(/\/$/, "") };
+						saveConfig(config);
+						if (config.chatModels?.length) registerWithPi(pi, config, config.chatModels);
+						ui.notify("Endpoint saved", "info");
+					}
+					continue;
+				}
+
+				if (sub.startsWith("API key")) {
+					const next = await ui.input("API key (Dashboard → Keys)", config.apiKey || "");
+					if (next !== undefined) {
+						config = { ...config, apiKey: next.trim() || undefined };
+						saveConfig(config);
+						if (config.chatModels?.length) registerWithPi(pi, config, config.chatModels);
+						ui.notify(config.apiKey ? "API key saved" : "API key cleared", "info");
+					}
+					continue;
+				}
+
+				if (sub === "Clear API key") {
+					const ok = await ui.confirm("Clear API key?", "Env NINEROUTER_KEY still works if set.");
+					if (ok) {
+						config = { ...config, apiKey: undefined };
+						saveConfig(config);
+						if (config.chatModels?.length) registerWithPi(pi, config, config.chatModels);
+						ui.notify("API key cleared", "info");
+					}
+					continue;
+				}
+
+				if (sub === "Test connection") {
+					ui.notify("Testing…", "info");
+					const health = await healthCheck(config.endpoint);
+					if (!health.ok) {
+						ui.notify(`Health failed: ${health.error}`, "error");
+						continue;
+					}
+					const chat = await fetchKind(config.endpoint, resolveApiKey(config), "chat");
+					if (!chat.ok) {
+						ui.notify(`Health OK, /v1/models failed: ${chat.error}`, "warning");
+						continue;
+					}
+					ui.notify(`OK · health · ${chat.models.length} chat models`, "info");
 				}
 			}
 			continue;
 		}
 
-		if (choice.startsWith("🔑")) {
-			const next = await ui.input("API key (Dashboard → Keys)", config.apiKey || "sk-…");
-			if (next !== undefined) {
-				const trimmed = next.trim();
-				config = { ...config, apiKey: trimmed || undefined };
-				saveConfig(config);
-				if (config.chatModels?.length) registerWithPi(pi, config, config.chatModels);
-				ui.notify(trimmed ? "API key saved" : "API key cleared", "info");
-			}
-			continue;
-		}
-
-		if (choice.startsWith("🧹")) {
-			const ok = await ui.confirm("Clear API key?", "Remove stored key from config? (env NINEROUTER_KEY still works)");
-			if (ok) {
-				config = { ...config, apiKey: undefined };
-				saveConfig(config);
-				if (config.chatModels?.length) registerWithPi(pi, config, config.chatModels);
-				ui.notify("API key cleared", "info");
-			}
-			continue;
-		}
-
-		if (choice.startsWith("🩺")) {
-			ui.notify("Testing…", "info");
-			const health = await healthCheck(config.endpoint);
-			if (!health.ok) {
-				ui.notify(`Health failed: ${health.error}`, "error");
-				continue;
-			}
-			const chat = await fetchKind(config.endpoint, resolveApiKey(config), "chat");
-			if (!chat.ok) {
-				ui.notify(`Health OK, but /v1/models failed: ${chat.error}`, "warning");
-				continue;
-			}
-			ui.notify(`OK — health ✓ · ${chat.models.length} chat models visible`, "info");
-			continue;
-		}
-
-		if (choice.startsWith("⬇")) {
-			ui.notify("Fetching catalogs from 9Router…", "info");
+		if (choice === "Sync models") {
+			ui.notify("Fetching catalogs…", "info");
 			const sync = await fetchAllAndBuild(config, {
 				onProgress: (msg) => ui.notify(msg, "info"),
 			});
@@ -799,7 +808,6 @@ async function runNineRouterUI(pi: ExtensionAPI, ctx: ExtensionContext): Promise
 			config = applySyncToConfig(config, sync);
 			registerWithPi(pi, config, sync.chatModels);
 
-			// Notify companion extensions (e.g. 9router-tools) that catalogs refreshed
 			pi.events.emit("9router:synced", {
 				endpoint: config.endpoint,
 				counts: sync.counts,
@@ -808,13 +816,12 @@ async function runNineRouterUI(pi: ExtensionAPI, ctx: ExtensionContext): Promise
 			});
 
 			const summary = [
-				`Registered ${sync.chatModels.length} chat models as provider "${PROVIDER_ID}"`,
+				`Registered ${sync.chatModels.length} chat models (provider ${PROVIDER_ID})`,
 				...Object.entries(sync.counts).map(([k, n]) => `  ${k}: ${n}`),
 				sync.error ? `Note: ${sync.error}` : "",
 				"",
-				"Open /model and select provider 9router (or search a model id).",
-				"Configure tools (image/tts/stt/…) with /9router-tools.",
-				"Changes apply immediately — /reload not required for provider update.",
+				"Next: /model → provider 9router",
+				"Tools: /9router-tools",
 			]
 				.filter(Boolean)
 				.join("\n");
@@ -823,15 +830,15 @@ async function runNineRouterUI(pi: ExtensionAPI, ctx: ExtensionContext): Promise
 			continue;
 		}
 
-		if (choice.startsWith("📚")) {
+		if (choice === "Browse catalog") {
 			await browseCatalog(ui, config);
 			continue;
 		}
 
-		if (choice.startsWith("✕")) {
+		if (choice === "Unregister chat models") {
 			const ok = await ui.confirm(
-				"Unregister?",
-				`Remove ${config.chatModels?.length || 0} chat models from pi provider "${PROVIDER_ID}"?`,
+				"Unregister chat models?",
+				`Remove ${config.chatModels?.length || 0} models from provider "${PROVIDER_ID}".`,
 			);
 			if (!ok) continue;
 			try {
@@ -846,7 +853,6 @@ async function runNineRouterUI(pi: ExtensionAPI, ctx: ExtensionContext): Promise
 			};
 			saveConfig(config);
 			ui.notify("Chat models unregistered", "info");
-			continue;
 		}
 	}
 }
