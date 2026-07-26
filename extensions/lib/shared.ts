@@ -120,6 +120,117 @@ export function isSyncStale(lastSync?: string, maxAgeMs = STALE_SYNC_MS): boolea
 	return Date.now() - t > maxAgeMs;
 }
 
+// ── Footer status (single slot for both extensions) ─────────────
+
+/** Default on/off for capability tools — keep in sync with CAPS in 9router-tools. */
+export const TOOL_CAP_DEFAULTS: Record<string, boolean> = {
+	image: true,
+	tts: true,
+	embed: false,
+	web_search: true,
+	web_fetch: true,
+};
+
+/** One footer key so we never show two competing "9router" / "tools" lines. */
+export const FOOTER_STATUS_ID = "9router";
+/** Cleared on paint so older installs drop the second status chip. */
+export const FOOTER_STATUS_LEGACY_ID = "9router-tools";
+
+export interface FooterSnapshot {
+	/** false hides the chip entirely (default true) */
+	enabled: boolean;
+	chatCount: number;
+	toolsOn: number;
+	toolsTotal: number;
+	lastSync?: string;
+}
+
+export function countEnabledTools(
+	capabilities?: Partial<Record<string, { enabled?: boolean }>>,
+): { on: number; total: number } {
+	const ids = Object.keys(TOOL_CAP_DEFAULTS);
+	let on = 0;
+	for (const id of ids) {
+		const saved = capabilities?.[id]?.enabled;
+		const enabled = saved ?? TOOL_CAP_DEFAULTS[id];
+		if (enabled) on++;
+	}
+	return { on, total: ids.length };
+}
+
+/** Footer chip is on unless `showFooter` is explicitly false in 9router.json. */
+export function isFooterEnabled(raw: Record<string, unknown> = loadJsonFile()): boolean {
+	return raw.showFooter !== false;
+}
+
+export function setFooterEnabled(enabled: boolean): void {
+	saveJsonMerge({ showFooter: enabled });
+}
+
+/** Build footer snapshot from the shared 9router.json blob. */
+export function footerFromConfig(raw: Record<string, unknown> = loadJsonFile()): FooterSnapshot {
+	const chatModels = raw.chatModels;
+	const chatCount = Array.isArray(chatModels) ? chatModels.length : 0;
+	const caps = raw.capabilities as Partial<Record<string, { enabled?: boolean }>> | undefined;
+	const { on, total } = countEnabledTools(caps);
+	return {
+		enabled: raw.showFooter !== false,
+		chatCount,
+		toolsOn: on,
+		toolsTotal: total,
+		lastSync: typeof raw.lastSync === "string" ? raw.lastSync : undefined,
+	};
+}
+
+/**
+ * Footer chip text.
+ *
+ * Examples:
+ *   `9router(sync)`
+ *   `9router(95 Models · 3/5 Tools)`
+ *   `9router(95 Models · 3/5 Tools · stale)`
+ */
+export function formatFooterText(snap: FooterSnapshot): { text: string; tone: "dim" | "warning" } {
+	const stale = isSyncStale(snap.lastSync);
+	if (!snap.lastSync && snap.chatCount === 0) {
+		return { text: "9router(sync)", tone: "dim" };
+	}
+	const inner: string[] = [];
+	if (snap.chatCount > 0) {
+		inner.push(`${snap.chatCount} Model${snap.chatCount === 1 ? "" : "s"}`);
+	} else {
+		inner.push("no models");
+	}
+	if (snap.toolsTotal > 0) {
+		inner.push(`${snap.toolsOn}/${snap.toolsTotal} Tools`);
+	}
+	if (stale) inner.push("stale");
+	return {
+		text: `9router(${inner.join(" · ")})`,
+		tone: stale ? "warning" : "dim",
+	};
+}
+
+type StatusUi = {
+	setStatus: (id: string, text: string | undefined) => void;
+	theme: { fg: (name: string, text: string) => string };
+};
+
+/**
+ * Paint or clear the single 9Router footer chip.
+ * Always clears the legacy `9router-tools` chip from older installs.
+ */
+export function paintFooterStatus(ui: StatusUi, snap?: FooterSnapshot): void {
+	ui.setStatus(FOOTER_STATUS_LEGACY_ID, undefined);
+	const s = snap ?? footerFromConfig();
+	if (!s.enabled) {
+		ui.setStatus(FOOTER_STATUS_ID, undefined);
+		return;
+	}
+	const { text, tone } = formatFooterText(s);
+	ui.setStatus(FOOTER_STATUS_ID, ui.theme.fg(tone, text));
+}
+
 // ── Abort / timeout ─────────────────────────────────────────────
 
 /** Combine optional parent signal with a timeout. */

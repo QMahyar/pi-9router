@@ -11,8 +11,11 @@
 | Connection | Endpoint, API key, test, clear key |
 | Diagnose | Health, per-kind list latency, sample `/models/info`, voice probes |
 | Browse catalog | chat / image / tts / embedding / web / … |
+| Footer on/off | Toggle the status-bar chip (`showFooter` in `9router.json`) |
 | Status | Summary (flags stale sync >24h) |
 | Unregister chat models | Drop provider models |
+
+**Footer chip** (when on): `9router(95 Models · 3/5 Tools)` — adds `· stale` if last sync is >24h.
 
 Sync reports names from server vs derived, info fetched vs skipped (already rich),
 and total timing.

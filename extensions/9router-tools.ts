@@ -39,9 +39,11 @@ import {
 	DEFAULT_OUTPUT_DIR,
 	TIMEOUT,
 	downloadUrl,
+	footerFromConfig,
 	isSyncStale,
 	loadJsonFile,
 	normalizeEndpoint,
+	paintFooterStatus,
 	postBinary,
 	postJson,
 	resolveApiKey,
@@ -1296,17 +1298,14 @@ export default function (pi: ExtensionAPI) {
 
 	const applyFromDisk = () => applyToolActivation(pi, loadRaw());
 
+	const refreshFooter = (ui: ExtensionContext["ui"]) => {
+		paintFooterStatus(ui, footerFromConfig());
+	};
+
 	pi.on("session_start", async (_event, ctx) => {
-		const cfg = saveRaw({});
+		saveRaw({}); // strip legacy keys
 		applyFromDisk();
-		const enabled = CAPS.filter((c) => getCapState(cfg, c).enabled).length;
-		if (ctx.hasUI) {
-			const stale = isSyncStale(cfg.lastSync);
-			ctx.ui.setStatus(
-				"9router-tools",
-				ctx.ui.theme.fg(stale ? "warning" : "dim", `tools ${enabled}/${CAPS.length}${stale ? " · stale" : ""}`),
-			);
-		}
+		if (ctx.hasUI) refreshFooter(ctx.ui);
 	});
 
 	pi.events.on("9router:synced", () => {
@@ -1328,6 +1327,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			await runToolsUI(pi, ctx);
 			applyFromDisk();
+			if (ctx.hasUI) refreshFooter(ctx.ui);
 		},
 	});
 }

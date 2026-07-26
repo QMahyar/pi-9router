@@ -42,6 +42,10 @@ import {
 	postBinary,
 	resolveApiKey,
 	saveJsonMerge,
+	paintFooterStatus,
+	footerFromConfig,
+	isFooterEnabled,
+	setFooterEnabled,
 	withTimeout,
 } from "./lib/shared.ts";
 
@@ -936,11 +940,13 @@ function statusLines(config: Config): string[] {
 	const counts = config.counts || {};
 	const chat = config.chatModels?.length ?? counts.chat ?? 0;
 	const stale = isSyncStale(config.lastSync);
+	const footerOn = isFooterEnabled();
 	const lines = [
 		`Endpoint:  ${config.endpoint}`,
 		`API key:   ${config.apiKey ? maskedKey(config.apiKey) : process.env.NINEROUTER_KEY ? maskedKey(process.env.NINEROUTER_KEY) + " (env)" : "(not set — ok if 9Router auth off)"}`,
 		`Last sync: ${config.lastSync || "never"}${config.lastSyncMode ? ` (${config.lastSyncMode})` : ""}${stale ? "  ⚠ stale (>24h)" : ""}`,
 		`Chat registered: ${chat}`,
+		`Footer:    ${footerOn ? "on" : "off"}`,
 	];
 	const extras = (["image", "tts", "embedding", "web", "image-to-text"] as const)
 		.map((k) => (counts[k] ? `${k}:${counts[k]}` : null))
@@ -1109,6 +1115,7 @@ async function runSync(
 		.join("\n");
 
 	await ui.confirm("Sync complete", summary);
+	paintFooterStatus(ui, footerFromConfig());
 	return config;
 }
 
@@ -1120,10 +1127,12 @@ async function runNineRouterUI(pi: ExtensionAPI, ctx: ExtensionContext): Promise
 		const chatN = config.chatModels?.length ?? 0;
 		const synced = config.lastSync ? new Date(config.lastSync).toLocaleString() : "never";
 		const stale = isSyncStale(config.lastSync);
+		const footerOn = isFooterEnabled();
 		const header = [
 			`Endpoint  ${config.endpoint}`,
 			`Key       ${config.apiKey ? maskedKey(config.apiKey) : process.env.NINEROUTER_KEY ? maskedKey(process.env.NINEROUTER_KEY) + " (env)" : "not set"}`,
 			`Chat      ${chatN} registered · last sync ${synced}${config.lastSyncMode ? ` (${config.lastSyncMode})` : ""}${stale ? " ⚠" : ""}`,
+			`Footer    ${footerOn ? "on" : "off"}`,
 		].join("\n");
 
 		const menu = [
@@ -1132,13 +1141,25 @@ async function runNineRouterUI(pi: ExtensionAPI, ctx: ExtensionContext): Promise
 			"Connection",
 			"Diagnose",
 			"Browse catalog",
+			footerOn ? "Footer: on  (hide from status bar)" : "Footer: off  (show in status bar)",
 			"Status",
 			"Unregister chat models",
 			"Close",
 		];
 
 		const choice = await ui.select(`9Router\n${header}`, menu);
-		if (!choice || choice === "Close") break;
+		if (!choice || choice === "Close") {
+			paintFooterStatus(ui, footerFromConfig());
+			break;
+		}
+
+		if (choice.startsWith("Footer:")) {
+			const next = !footerOn;
+			setFooterEnabled(next);
+			paintFooterStatus(ui, footerFromConfig());
+			ui.notify(next ? "Footer on" : "Footer off", "info");
+			continue;
+		}
 
 		if (choice === "Status") {
 			await ui.confirm("Status", statusLines(config).join("\n"));
@@ -1278,26 +1299,13 @@ export default async function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
-		const cfg = loadConfig();
+	const refreshFooter = (ctx: { hasUI?: boolean; ui: ExtensionContext["ui"] }) => {
 		if (!ctx.hasUI) return;
-		if (cfg.endpoint && !cfg.lastSync) {
-			ctx.ui.setStatus(
-				"9router",
-				ctx.ui.theme.fg("dim", "9router: run /9router to sync models"),
-			);
-		} else if (isSyncStale(cfg.lastSync)) {
-			const n = cfg.chatModels?.length || 0;
-			ctx.ui.setStatus(
-				"9router",
-				ctx.ui.theme.fg("warning", `9router · ${n} models · stale — re-sync`),
-			);
-		} else if (cfg.chatModels?.length) {
-			ctx.ui.setStatus(
-				"9router",
-				ctx.ui.theme.fg("dim", `9router · ${cfg.chatModels.length} models`),
-			);
-		}
+		paintFooterStatus(ctx.ui, footerFromConfig());
+	};
+
+	pi.on("session_start", async (_event, ctx) => {
+		refreshFooter(ctx);
 	});
 }
 
