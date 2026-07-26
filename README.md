@@ -98,6 +98,7 @@ Use **one** search stack at a time if you want to avoid overlapping tools.
 | [Setup](docs/setup.md) | Install, first run, env vars |
 | [Usage](docs/usage.md) | Menus, tools, on/off behavior |
 | [Dev](docs/dev.md) | Layout for contributors |
+| [Changelog](CHANGELOG.md) | Unreleased WIP + version history |
 
 ## Links
 

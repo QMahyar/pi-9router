@@ -8,7 +8,12 @@ extensions/
     shared.ts        # HTTP, timeouts, config merge (not an entry point)
 scripts/
   e2e-test.ts        # live E2E against local 9Router
+CHANGELOG.md         # cross-session WIP + release history (update every session)
 ```
+
+**Handoff:** keep `[Unreleased]` in `CHANGELOG.md` current while you work; on release,
+move bullets into a `[X.Y.Z]` section. Local machine install/publish steps live in
+gitignored `AGENTS.md` when present.
 
 - Core emits `9router:synced` after catalog refresh.
 - Tools call `setActiveTools` so only enabled tools hit the model prompt.
