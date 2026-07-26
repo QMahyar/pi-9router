@@ -14,14 +14,10 @@
  * OS dictation app (e.g. Superwhisper, Spokenly) for voice → editor.
  *
  * Each tool's description carries the ids available for its capability, and a
- * `model` argument is resolved against the catalog before any request goes out,
- * so a guessed name fails locally with the real ids rather than as an opaque
- * upstream routing error.
+ * `model` argument is resolved against the catalog before any request goes out.
  *
- * Note the wire convention differs per endpoint: /v1/images/generations,
- * /v1/audio/speech and /v1/embeddings take the full catalog id, but /v1/search
- * and /v1/web/fetch take a bare *provider* name ("exa", not "exa/search"). The
- * catalog id is kept for display; only the request body is stripped.
+ * Wire convention: /v1/images/generations, /v1/audio/speech, /v1/embeddings take
+ * the full catalog id; /v1/search and /v1/web/fetch take a bare provider name.
  *
  * Shared config: ~/.pi/agent/9router.json
  */
@@ -36,24 +32,30 @@ import {
 	writeFileSync,
 	statSync,
 } from "node:fs";
-import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
-import { homedir } from "node:os";
+import { basename, extname, isAbsolute, join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
+import {
+	CONFIG_PATH,
+	DEFAULT_OUTPUT_DIR,
+	TIMEOUT,
+	downloadUrl,
+	isSyncStale,
+	loadJsonFile,
+	normalizeEndpoint,
+	postBinary,
+	postJson,
+	resolveApiKey,
+	saveJsonMerge,
+} from "./lib/shared.ts";
 
-// ── Shared config ───────────────────────────────────────────────
-
-const CONFIG_PATH = join(homedir(), ".pi", "agent", "9router.json");
-const DEFAULT_ENDPOINT = "http://localhost:20128";
-const DEFAULT_OUTPUT_DIR = join(homedir(), ".pi", "agent", "9router-output");
+// ── Types ───────────────────────────────────────────────────────
 
 type CapId = "image" | "tts" | "embed" | "web_search" | "web_fetch";
 
 interface CatalogEntry {
 	id: string;
 	name?: string;
-	/** Bucket kind from the list endpoint (chat, image, tts, web, …) */
 	kind: string;
-	/** Precise kind from /v1/models/info (llm, webSearch, webFetch, …); set by sync */
 	detailKind?: string;
 	ownedBy?: string;
 	capabilities?: unknown;
@@ -63,11 +65,6 @@ interface CatalogEntry {
 	note?: string;
 }
 
-/**
- * Providers whose `model` is a free-form voice / language id rather than a
- * published model. The catalog only carries a sample of these, so an id under
- * one of these prefixes is accepted even when it is not listed.
- */
 const VOICE_PROVIDER_PREFIXES = ["edge-tts", "google-tts", "el", "local-device"];
 
 interface CapState {
@@ -81,6 +78,7 @@ interface ToolsConfigSlice {
 	catalog?: CatalogEntry[];
 	counts?: Record<string, number>;
 	lastSync?: string;
+	lastSyncMode?: string;
 	capabilities?: Partial<Record<CapId, CapState>>;
 	outputDir?: string;
 	/** Inline generated images into the conversation as base64 (default false) */
@@ -125,8 +123,6 @@ export const CAPS: CapDef[] = [
 		id: "web_search",
 		tool: "nr_web_search",
 		label: "Web search",
-		// detailKind comes from /v1/models/info ("webSearch"); the id suffix is the
-		// fallback for catalogs synced before enrichment existed.
 		catalogKind: (e) =>
 			e.kind === "web" && (e.detailKind === "webSearch" || (!e.detailKind && /search/i.test(e.id))),
 		defaultEnabled: true,
@@ -143,44 +139,22 @@ export const CAPS: CapDef[] = [
 	},
 ];
 
-// ── Config I/O ──────────────────────────────────────────────────
+// ── Config ──────────────────────────────────────────────────────
 
 function loadRaw(): ToolsConfigSlice {
-	if (!existsSync(CONFIG_PATH)) return {};
-	try {
-		return JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as ToolsConfigSlice;
-	} catch {
-		return {};
-	}
+	return loadJsonFile() as ToolsConfigSlice;
 }
 
 function saveRaw(patch: Partial<ToolsConfigSlice>): ToolsConfigSlice {
-	const dir = dirname(CONFIG_PATH);
-	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-	const cur = loadRaw();
-	const next: ToolsConfigSlice = { ...cur, ...patch };
-	if (patch.capabilities) {
-		next.capabilities = { ...(cur.capabilities || {}), ...patch.capabilities };
-	}
-	// Drop legacy keys if present (stt / voice / ffmpeg from older versions)
-	const out: Record<string, unknown> = { ...next };
-	delete out.voice;
-	delete out.ffmpegPath;
-	if (out.capabilities && typeof out.capabilities === "object") {
-		const caps = { ...(out.capabilities as Record<string, unknown>) };
-		delete caps.stt;
-		out.capabilities = caps;
-	}
-	writeFileSync(CONFIG_PATH, JSON.stringify(out, null, 2));
-	return next;
+	return saveJsonMerge(patch as Record<string, unknown>) as ToolsConfigSlice;
 }
 
 function endpointOf(cfg: ToolsConfigSlice): string {
-	return (cfg.endpoint || process.env.NINEROUTER_URL || DEFAULT_ENDPOINT).replace(/\/$/, "");
+	return normalizeEndpoint(cfg.endpoint);
 }
 
 function apiKeyOf(cfg: ToolsConfigSlice): string {
-	return (cfg.apiKey || process.env.NINEROUTER_KEY || "9router").trim();
+	return resolveApiKey(cfg.apiKey);
 }
 
 function outputDirOf(cfg: ToolsConfigSlice): string {
@@ -202,12 +176,10 @@ function modelsForCap(cfg: ToolsConfigSlice, cap: CapDef): CatalogEntry[] {
 	return catalog.filter((e) => e.kind === filter);
 }
 
-/** Lowercase and drop every separator, so "nano-banana" and "NanoBanana" collapse to the same key. */
 function normalizeId(s: string): string {
 	return s.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-/** Portion of an id after the last slash: "nb/nanobanana-flash" → "nanobanana-flash". */
 function leafOf(id: string): string {
 	const i = id.lastIndexOf("/");
 	return i >= 0 ? id.slice(i + 1) : id;
@@ -225,16 +197,6 @@ type ModelResolution =
 
 /**
  * Turn whatever the caller passed for `model` into a real catalog id.
- *
- * Previously the override was forwarded verbatim, so a plausible-looking guess
- * such as "nano-banana" reached 9Router, which split it on the missing slash and
- * failed with "No credentials for provider: nano" — an error that says nothing
- * about the actual problem. Matching against the catalog first turns that into a
- * hit (or a list of real ids) without a round trip.
- *
- * Order: exact id → case-insensitive id → normalized id / leaf / name → unique
- * normalized substring. Voice providers pass through unmatched, since the
- * catalog only samples their voices.
  */
 export function resolveModel(cfg: ToolsConfigSlice, cap: CapDef, override?: string): ModelResolution {
 	const models = modelsForCap(cfg, cap);
@@ -242,8 +204,6 @@ export function resolveModel(cfg: ToolsConfigSlice, cap: CapDef, override?: stri
 
 	if (!want) {
 		const saved = getCapState(cfg, cap).model?.trim();
-		// A saved default can outlive the model it names (provider removed, resync).
-		// Prefer it only while it is still real, rather than sending a stale id.
 		const usable =
 			saved && (models.some((m) => m.id === saved) || isVoiceProviderId(saved)) ? saved : undefined;
 		const fallback = usable || models[0]?.id;
@@ -290,7 +250,6 @@ export function resolveModel(cfg: ToolsConfigSlice, cap: CapDef, override?: stri
 		if (partial.length > 1) return { ok: false, message: ambiguous(want, partial) };
 	}
 
-	// edge-tts/<voice> and friends accept ids the catalog never lists.
 	if (isVoiceProviderId(want)) return { ok: true, id: want };
 
 	return {
@@ -305,32 +264,14 @@ export function resolveModel(cfg: ToolsConfigSlice, cap: CapDef, override?: stri
 	};
 }
 
-/** Max concrete ids to spell out per capability before summarising the rest. */
 const MAX_LISTED_MODELS = 14;
 
-/**
- * Whether to inline a generated image into the conversation. Off by default.
- *
- * The attachment is consumed by the *chat* model, not the image model that
- * produced it, and it is resent on every subsequent turn. A 2 MB generation is
- * ~2.7M base64 chars (~675k tokens), which overflows most context windows and
- * surfaces as an opaque "Upstream request failed" well after the file was
- * written successfully — and text-only models reject it outright.
- *
- * Returning the path instead leaves the decision to pi, which reads and
- * downsizes images natively when the model supports vision.
- */
 function shouldAttachImage(cfg: ToolsConfigSlice): boolean {
 	return cfg.attachImages === true;
 }
 
 /**
- * Render the capability's available ids for the tool description.
- *
- * The agent otherwise has no view of the catalog and has to guess an id from a
- * product name, which is how "nano-banana" gets tried instead of
- * "nb/nanobanana-flash". Names are included because that is the bridge from what
- * a user says to what the server accepts.
+ * Render available ids (+ optional params) for the tool description.
  */
 export function describeModels(cfg: ToolsConfigSlice, cap: CapDef): string {
 	const models = modelsForCap(cfg, cap);
@@ -344,12 +285,15 @@ export function describeModels(cfg: ToolsConfigSlice, cap: CapDef): string {
 	if (head.length) {
 		parts.push(
 			head
-				.map((m) => (m.name && m.name !== m.id ? `${m.id} (${m.name})` : m.id))
+				.map((m) => {
+					const label = m.name && m.name !== m.id ? `${m.id} (${m.name})` : m.id;
+					const p = m.params?.length ? ` [${m.params.join(", ")}]` : "";
+					return label + p;
+				})
 				.join(", ") + (listed.length > head.length ? `, +${listed.length - head.length} more` : ""),
 		);
 	}
 
-	// Voice providers accept any voice id, so a pattern plus samples beats a long list.
 	const byProvider = new Map<string, string[]>();
 	for (const m of synthetic) {
 		const p = m.ownedBy || leafOf(m.id);
@@ -364,7 +308,6 @@ export function describeModels(cfg: ToolsConfigSlice, cap: CapDef): string {
 	return `Available: ${parts.join("; ")}.`;
 }
 
-/** Base description + the live catalog for this capability. */
 function withModels(cfg: ToolsConfigSlice, cap: CapDef, base: string): string {
 	return `${base}\n\n${describeModels(cfg, cap)}\nPass one of these exact ids as \`model\`, or omit \`model\` to use the configured default.`;
 }
@@ -374,81 +317,6 @@ function ambiguous(want: string, matches: CatalogEntry[]): string {
 		`"${want}" matches ${matches.length} models — pass one exactly:`,
 		...matches.map((m) => `  ${m.id}${m.name && m.name !== m.id ? `  (${m.name})` : ""}`),
 	].join("\n");
-}
-
-// ── HTTP ────────────────────────────────────────────────────────
-
-function authHeaders(apiKey: string, json = true): Record<string, string> {
-	const h: Record<string, string> = { Accept: "*/*" };
-	if (json) h["Content-Type"] = "application/json";
-	if (apiKey) h.Authorization = `Bearer ${apiKey}`;
-	return h;
-}
-
-async function postJson(
-	url: string,
-	apiKey: string,
-	body: unknown,
-	signal?: AbortSignal,
-): Promise<{ ok: true; status: number; data: any } | { ok: false; status: number; error: string }> {
-	try {
-		const res = await fetch(url, {
-			method: "POST",
-			headers: authHeaders(apiKey, true),
-			body: JSON.stringify(body),
-			signal,
-		});
-		const text = await res.text();
-		let data: any = null;
-		try {
-			data = text ? JSON.parse(text) : null;
-		} catch {
-			data = text;
-		}
-		if (!res.ok) {
-			const msg =
-				typeof data === "string"
-					? data.slice(0, 400)
-					: data?.error?.message || data?.message || JSON.stringify(data).slice(0, 400);
-			return { ok: false, status: res.status, error: msg || res.statusText };
-		}
-		return { ok: true, status: res.status, data };
-	} catch (err: any) {
-		if (err?.name === "AbortError") return { ok: false, status: 0, error: "aborted" };
-		return { ok: false, status: 0, error: err?.message || String(err) };
-	}
-}
-
-async function postBinary(
-	url: string,
-	apiKey: string,
-	body: unknown,
-	signal?: AbortSignal,
-): Promise<
-	| { ok: true; status: number; bytes: Uint8Array; contentType: string }
-	| { ok: false; status: number; error: string }
-> {
-	try {
-		const res = await fetch(url, {
-			method: "POST",
-			headers: authHeaders(apiKey, true),
-			body: JSON.stringify(body),
-			signal,
-		});
-		if (!res.ok) {
-			const text = (await res.text()).slice(0, 400);
-			return { ok: false, status: res.status, error: text || res.statusText };
-		}
-		return {
-			ok: true,
-			status: res.status,
-			bytes: new Uint8Array(await res.arrayBuffer()),
-			contentType: res.headers.get("content-type") || "application/octet-stream",
-		};
-	} catch (err: any) {
-		if (err?.name === "AbortError") return { ok: false, status: 0, error: "aborted" };
-		return { ok: false, status: 0, error: err?.message || String(err) };
-	}
 }
 
 // ── File helpers ────────────────────────────────────────────────
@@ -509,14 +377,43 @@ function decodeDataUrlOrB64(raw: string): { bytes: Uint8Array; ext: string } | n
 	}
 }
 
-async function downloadUrl(url: string, signal?: AbortSignal) {
+/** Resolve a local image path for edit/reference; return base64 data URL or null. */
+function loadImageRef(pathOrData: string, cwd: string): string | null {
+	const raw = pathOrData.trim();
+	if (!raw) return null;
+	if (raw.startsWith("data:image/")) return raw;
+	// bare base64
+	if (/^[A-Za-z0-9+/=\s]+$/.test(raw) && raw.replace(/\s/g, "").length > 64) {
+		const cleaned = raw.replace(/\s/g, "");
+		try {
+			const buf = Buffer.from(cleaned, "base64");
+			if (buf.length > 32) {
+				const ext =
+					buf[0] === 0xff && buf[1] === 0xd8
+						? "jpeg"
+						: buf[0] === 0x89 && buf[1] === 0x50
+							? "png"
+							: "png";
+				return `data:image/${ext};base64,${cleaned}`;
+			}
+		} catch {
+			/* fall through to path */
+		}
+	}
+	const abs = isAbsolute(raw) ? raw : resolve(cwd, raw);
+	if (!existsSync(abs)) return null;
 	try {
-		const res = await fetch(url, { signal });
-		if (!res.ok) return null;
-		return {
-			bytes: new Uint8Array(await res.arrayBuffer()),
-			contentType: res.headers.get("content-type") || "application/octet-stream",
-		};
+		const bytes = readFileSync(abs);
+		const ext = extname(abs).toLowerCase();
+		const media =
+			ext === ".jpg" || ext === ".jpeg"
+				? "image/jpeg"
+				: ext === ".webp"
+					? "image/webp"
+					: ext === ".gif"
+						? "image/gif"
+						: "image/png";
+		return `data:${media};base64,${bytes.toString("base64")}`;
 	} catch {
 		return null;
 	}
@@ -563,7 +460,6 @@ function applyToolActivation(pi: ExtensionAPI, cfg: ToolsConfigSlice): void {
 	const active = new Set(pi.getActiveTools());
 	const allKnown = new Set(pi.getAllTools().map((t) => t.name));
 
-	// Always remove legacy STT tool if an older session still has it registered
 	active.delete("nr_stt");
 
 	for (const cap of CAPS) {
@@ -598,7 +494,8 @@ async function pickModel(
 	const items = models.map((m) => {
 		const star = m.id === current ? "* " : "  ";
 		const name = m.name && m.name !== m.id ? `  ${m.name}` : "";
-		return `${star}${m.id}${name}`;
+		const params = m.params?.length ? `  [${m.params.join(",")}]` : "";
+		return `${star}${m.id}${name}${params}`;
 	});
 	items.push("Use first available (clear default)");
 	items.push("Back");
@@ -654,7 +551,12 @@ async function configureCap(
 				ui.notify(needSyncHint(), "warning");
 				continue;
 			}
-			const text = models.map((m, i) => `${String(i + 1).padStart(2)}. ${m.id}`).join("\n");
+			const text = models
+				.map((m, i) => {
+					const p = m.params?.length ? `  params: ${m.params.join(", ")}` : "";
+					return `${String(i + 1).padStart(2)}. ${m.id}${m.name && m.name !== m.id ? `  (${m.name})` : ""}${p}`;
+				})
+				.join("\n");
 			await ui.confirm(`${cap.label} (${models.length})`, text);
 		}
 	}
@@ -662,9 +564,10 @@ async function configureCap(
 
 async function showStatus(ui: ExtensionContext["ui"], cfg: ToolsConfigSlice): Promise<void> {
 	const on = CAPS.filter((c) => getCapState(cfg, c).enabled).length;
+	const stale = isSyncStale(cfg.lastSync);
 	const lines = [
 		`Endpoint     ${endpointOf(cfg)}`,
-		`Catalog      ${cfg.lastSync ? new Date(cfg.lastSync).toLocaleString() : "never synced"}`,
+		`Catalog      ${cfg.lastSync ? new Date(cfg.lastSync).toLocaleString() : "never synced"}${cfg.lastSyncMode ? ` (${cfg.lastSyncMode})` : ""}${stale ? "  ⚠ stale" : ""}`,
 		`Output       ${outputDirOf(cfg)}`,
 		`Inline image ${shouldAttachImage(cfg) ? "on (base64 in tool result)" : "off — path only"}`,
 		`Tools on     ${on} / ${CAPS.length}`,
@@ -684,11 +587,12 @@ async function runToolsUI(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void
 	let cfg = loadRaw();
 
 	while (true) {
+		const stale = isSyncStale(cfg.lastSync);
 		const header = cfg.catalog?.length
 			? `Synced · ${Object.entries(cfg.counts || {})
 					.filter(([k]) => k !== "stt")
 					.map(([k, v]) => `${k} ${v}`)
-					.join(" · ")}`
+					.join(" · ")}${stale ? " · ⚠ stale" : ""}`
 			: "Catalog empty — run /9router → Sync models";
 
 		const rows = CAPS.map((c) => capRow(cfg, c));
@@ -758,6 +662,139 @@ function textFromResult(result: { content?: Array<{ type: string; text?: string 
 	);
 }
 
+// ── Image generation (n + optional edit ref) ────────────────────
+
+async function generateImages(opts: {
+	ep: string;
+	key: string;
+	outDir: string;
+	model: string;
+	prompt: string;
+	n: number;
+	size?: string;
+	quality?: string;
+	filename?: string;
+	/** data URL or local path already loaded as data URL */
+	imageDataUrl?: string;
+	signal?: AbortSignal;
+}): Promise<{ saved: string[]; error?: string }> {
+	const { ep, key, outDir, model, prompt, n, size, quality, filename, imageDataUrl, signal } = opts;
+	const saved: string[] = [];
+	const count = Math.min(Math.max(1, n), 4);
+
+	const baseBody: Record<string, unknown> = { model, prompt, n: 1 };
+	if (size) baseBody.size = size;
+	if (quality) baseBody.quality = quality;
+	if (imageDataUrl) {
+		// Providers accept `image` (single) and/or `images[]`
+		baseBody.image = imageDataUrl;
+		baseBody.images = [imageDataUrl];
+	}
+
+	for (let i = 0; i < count; i++) {
+		// Prefer binary (raw bytes) — matches skill default for saving files
+		const bin = await postBinary(
+			`${ep}/v1/images/generations?response_format=binary`,
+			key,
+			baseBody,
+			{ signal, timeoutMs: TIMEOUT.tool },
+		);
+		if (bin.ok && bin.bytes.length > 100) {
+			const ext = extFromContentType(bin.contentType, ".png");
+			const name =
+				(filename?.replace(/[^\w.\-]+/g, "_") && count === 1
+					? filename.replace(/[^\w.\-]+/g, "_")
+					: null) ||
+				`img-${stamp()}-${slug(prompt)}-${i}-${randomBytes(2).toString("hex")}${ext}`;
+			saved.push(writeBytes(outDir, name, bin.bytes));
+			continue;
+		}
+
+		// Fallback: b64_json
+		const res = await postJson(
+			`${ep}/v1/images/generations`,
+			key,
+			{ ...baseBody, response_format: "b64_json" },
+			{ signal, timeoutMs: TIMEOUT.tool },
+		);
+		if (res.ok) {
+			const rows = res.data?.data || [];
+			if (!rows.length && i === 0) {
+				// try url format once
+				const res2 = await postJson(
+					`${ep}/v1/images/generations`,
+					key,
+					{ ...baseBody, response_format: "url" },
+					{ signal, timeoutMs: TIMEOUT.tool },
+				);
+				if (!res2.ok) {
+					return {
+						saved,
+						error: `Image generation failed (${res2.status}): ${res2.error}`,
+					};
+				}
+				for (let j = 0; j < (res2.data?.data || []).length; j++) {
+					const url = res2.data.data[j].url;
+					if (!url) continue;
+					const dl = await downloadUrl(url, { signal });
+					if (!dl) continue;
+					const ext = extFromContentType(dl.contentType, ".png");
+					const nm =
+						filename?.replace(/[^\w.\-]+/g, "_") && (res2.data.data || []).length === 1
+							? filename.replace(/[^\w.\-]+/g, "_")
+							: `img-${stamp()}-${slug(prompt)}-${j}-${randomBytes(2).toString("hex")}${ext}`;
+					saved.push(writeBytes(outDir, nm, dl.bytes));
+				}
+				// url response may already include n images — done
+				break;
+			}
+			for (let j = 0; j < rows.length; j++) {
+				const b64 = rows[j].b64_json;
+				if (!b64) continue;
+				const dec = decodeDataUrlOrB64(b64);
+				if (!dec) continue;
+				const nm =
+					filename?.replace(/[^\w.\-]+/g, "_") && rows.length === 1 && count === 1
+						? filename.replace(/[^\w.\-]+/g, "_")
+						: `img-${stamp()}-${slug(prompt)}-${i}-${j}-${randomBytes(2).toString("hex")}${dec.ext}`;
+				saved.push(writeBytes(outDir, nm, dec.bytes));
+			}
+			// If b64 returned multiple for n:1, we still only wanted one iteration worth
+			if (rows.length > 1) break;
+			continue;
+		}
+
+		// Last resort url
+		const res2 = await postJson(
+			`${ep}/v1/images/generations`,
+			key,
+			{ ...baseBody, response_format: "url" },
+			{ signal, timeoutMs: TIMEOUT.tool },
+		);
+		if (!res2.ok) {
+			return {
+				saved,
+				error:
+					bin.ok === false
+						? `Image generation failed (${res.status}): ${res.error}`
+						: `Image generation failed (${res2.status}): ${res2.error}`,
+			};
+		}
+		for (let j = 0; j < (res2.data?.data || []).length; j++) {
+			const url = res2.data.data[j].url;
+			if (!url) continue;
+			const dl = await downloadUrl(url, { signal });
+			if (!dl) continue;
+			const ext = extFromContentType(dl.contentType, ".png");
+			const nm = `img-${stamp()}-${slug(prompt)}-${i}-${j}-${randomBytes(2).toString("hex")}${ext}`;
+			saved.push(writeBytes(outDir, nm, dl.bytes));
+		}
+		if ((res2.data?.data || []).length > 1) break;
+	}
+
+	return { saved };
+}
+
 // ── Tools ───────────────────────────────────────────────────────
 
 function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
@@ -768,13 +805,13 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 		description: withModels(
 			cfg,
 			cap,
-			"Generate an image through 9Router and save it to disk. Best for icons, logos, illustrations, UI mockups, and concept art. Returns the saved file path; the image itself is not embedded in the result, so read the path if you need to view it.",
+			"Generate an image through 9Router and save it to disk. Best for icons, logos, illustrations, UI mockups, and concept art. Optional image_path enables edit/img2img when the model supports it. Returns the saved file path; the image itself is not embedded in the result by default.",
 		),
 		promptSnippet: "Generate an image (9Router) and save the file path",
 		promptGuidelines: [
 			"Call nr_image_generate to create images, icons, logos, illustrations, or mockups.",
 			"Write a detailed prompt (subject, style, colors, composition).",
-			"Omit model unless the user names a specific image model; when they do, use an exact id from the tool description. Optional size, quality, n, filename.",
+			"Omit model unless the user names a specific image model; when they do, use an exact id from the tool description. Optional size, quality, n (1–4), filename, image_path (local path for edit/img2img).",
 			"Tell the user the saved file path from the tool result.",
 			"The image is not embedded in the result — read the returned path if you need to see it.",
 		],
@@ -785,6 +822,11 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			n: Type.Optional(Type.Integer({ description: "Number of images, 1–4 (default 1)", minimum: 1, maximum: 4 })),
 			quality: Type.Optional(Type.String({ description: "standard or hd when supported" })),
 			filename: Type.Optional(Type.String({ description: "Output file name only, no folders" })),
+			image_path: Type.Optional(
+				Type.String({
+					description: "Local path (or data URL) of a reference image for edit/img2img when the model supports it",
+				}),
+			),
 		}),
 		async execute(_id, params, signal, onUpdate, ctx) {
 			const cfg = loadRaw();
@@ -798,51 +840,50 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			const key = apiKeyOf(cfg);
 			const outDir = outputDirOf(cfg);
 			const n = Math.min(params.n ?? 1, 4);
-			onUpdate?.({ content: [{ type: "text", text: `Generating with ${model}…` }] });
 
-			const body: Record<string, unknown> = { model, prompt: params.prompt, n };
-			if (params.size) body.size = params.size;
-			if (params.quality) body.quality = params.quality;
-
-			const saved: string[] = [];
-			const bin = await postBinary(`${ep}/v1/images/generations?response_format=binary`, key, { ...body, n: 1 }, signal);
-			if (bin.ok && bin.bytes.length > 100) {
-				const ext = extFromContentType(bin.contentType, ".png");
-				const name =
-					params.filename?.replace(/[^\w.\-]+/g, "_") ||
-					`img-${stamp()}-${slug(params.prompt)}-${randomBytes(2).toString("hex")}${ext}`;
-				saved.push(writeBytes(outDir, name, bin.bytes));
-			} else {
-				const res = await postJson(`${ep}/v1/images/generations`, key, { ...body, response_format: "b64_json" }, signal);
-				if (!res.ok) {
-					const res2 = await postJson(`${ep}/v1/images/generations`, key, { ...body, response_format: "url" }, signal);
-					if (!res2.ok) return toolError(`Image generation failed (${res2.status}): ${res2.error}`, { model });
-					for (let i = 0; i < (res2.data?.data || []).length; i++) {
-						const url = res2.data.data[i].url;
-						if (!url) continue;
-						const dl = await downloadUrl(url, signal);
-						if (!dl) continue;
-						const ext = extFromContentType(dl.contentType, ".png");
-						const nm = params.filename?.replace(/[^\w.\-]+/g, "_") || `img-${stamp()}-${i}${ext}`;
-						saved.push(writeBytes(outDir, nm, dl.bytes));
-					}
-				} else {
-					for (let i = 0; i < (res.data?.data || []).length; i++) {
-						const b64 = res.data.data[i].b64_json;
-						if (!b64) continue;
-						const dec = decodeDataUrlOrB64(b64);
-						if (!dec) continue;
-						const nm = params.filename?.replace(/[^\w.\-]+/g, "_") || `img-${stamp()}-${i}${dec.ext}`;
-						saved.push(writeBytes(outDir, nm, dec.bytes));
-					}
+			let imageDataUrl: string | undefined;
+			if (params.image_path?.trim()) {
+				const loaded = loadImageRef(params.image_path, ctx.cwd);
+				if (!loaded) {
+					return toolError(`Could not read image_path: ${params.image_path}`, {
+						image_path: params.image_path,
+					});
 				}
+				imageDataUrl = loaded;
 			}
 
+			onUpdate?.({
+				content: [
+					{
+						type: "text",
+						text: `Generating ${n} image(s) with ${model}${imageDataUrl ? " (edit/ref)" : ""}…`,
+					},
+				],
+			});
+
+			const { saved, error } = await generateImages({
+				ep,
+				key,
+				outDir,
+				model,
+				prompt: params.prompt,
+				n,
+				size: params.size,
+				quality: params.quality,
+				filename: params.filename,
+				imageDataUrl,
+				signal,
+			});
+
+			if (error && !saved.length) return toolError(error, { model });
 			if (!saved.length) return toolError("No image data returned.", { model });
+
 			const text = [
 				`Generated ${saved.length} image(s) · ${model}`,
 				picked.note ? `Model ${picked.note}` : "",
+				params.image_path ? `Reference: ${params.image_path}` : "",
 				`Prompt: ${params.prompt}`,
+				error ? `Note: ${error}` : "",
 				...saved.map((p) => `File: ${p}`),
 			]
 				.filter(Boolean)
@@ -853,8 +894,6 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 				| { type: "image"; source: { type: "base64"; mediaType: string; data: string } }
 			> = [{ type: "text", text }];
 
-			// Opt-in only — see shouldAttachImage. By default the tool returns just the
-			// path and lets pi read the file if the model can use it.
 			let attached = false;
 			if (shouldAttachImage(cfg)) {
 				try {
@@ -872,13 +911,21 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 						attached = true;
 					}
 				} catch {
-					/* fall through — the path is already in the text */
+					/* path is already in text */
 				}
 			}
 
 			return {
 				content,
-				details: { model, files: saved, prompt: params.prompt, cwd: ctx.cwd, attached },
+				details: {
+					model,
+					files: saved,
+					prompt: params.prompt,
+					n: saved.length,
+					cwd: ctx.cwd,
+					attached,
+					image_path: params.image_path,
+				},
 			};
 		},
 		renderResult(result, { expanded }, theme) {
@@ -927,20 +974,48 @@ function registerTtsTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			const ep = endpointOf(cfg);
 			const key = apiKeyOf(cfg);
 			const outDir = outputDirOf(cfg);
-			const res = await postJson(`${ep}/v1/audio/speech?response_format=json`, key, { model, input: params.input }, signal);
+
+			// Prefer raw audio bytes (skill default); JSON is fallback
 			let bytes: Uint8Array | null = null;
 			let ext = ".mp3";
-			if (res.ok && res.data?.audio) {
-				bytes = Buffer.from(res.data.audio, "base64");
-				if (res.data.format) ext = `.${String(res.data.format).replace(/^\./, "")}`;
-			} else {
-				const bin = await postBinary(`${ep}/v1/audio/speech`, key, { model, input: params.input }, signal);
-				if (!bin.ok) return toolError(`TTS failed (${bin.status}): ${bin.error}`, { model });
-				bytes = bin.bytes;
-				ext = extFromContentType(bin.contentType, ".mp3");
+			const bin = await postBinary(`${ep}/v1/audio/speech`, key, { model, input: params.input }, {
+				signal,
+				timeoutMs: TIMEOUT.tool,
+			});
+			if (bin.ok && bin.bytes.length > 64) {
+				// Reject tiny JSON error bodies disguised as 200
+				const ct = bin.contentType.toLowerCase();
+				if (ct.includes("json") || bin.bytes[0] === 0x7b /* { */) {
+					// fall through to json path
+				} else {
+					bytes = bin.bytes;
+					ext = extFromContentType(bin.contentType, ".mp3");
+				}
 			}
+
+			if (!bytes) {
+				const res = await postJson(
+					`${ep}/v1/audio/speech?response_format=json`,
+					key,
+					{ model, input: params.input },
+					{ signal, timeoutMs: TIMEOUT.tool },
+				);
+				if (res.ok && res.data?.audio) {
+					bytes = Buffer.from(res.data.audio, "base64");
+					if (res.data.format) ext = `.${String(res.data.format).replace(/^\./, "")}`;
+				} else {
+					const detail = !bin.ok
+						? `binary HTTP ${bin.status}: ${bin.error}`
+						: !res.ok
+							? `json HTTP ${res.status}: ${res.error}`
+							: "no audio field in json response";
+					return toolError(`TTS failed (${detail})`, { model });
+				}
+			}
+
 			if (!bytes?.length) return toolError("Empty audio.", { model });
-			const name = params.filename?.replace(/[^\w.\-]+/g, "_") || `tts-${stamp()}-${slug(params.input)}${ext}`;
+			const name =
+				params.filename?.replace(/[^\w.\-]+/g, "_") || `tts-${stamp()}-${slug(params.input)}${ext}`;
 			const path = writeBytes(outDir, name, bytes);
 			return toolOk(
 				[
@@ -1000,7 +1075,10 @@ function registerEmbedTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			onUpdate?.({ content: [{ type: "text", text: `Embedding ${parts.length} input(s)…` }] });
 			const body: Record<string, unknown> = { model, input: parts.length === 1 ? parts[0] : parts };
 			if (params.dimensions) body.dimensions = params.dimensions;
-			const res = await postJson(`${endpointOf(cfg)}/v1/embeddings`, apiKeyOf(cfg), body, signal);
+			const res = await postJson(`${endpointOf(cfg)}/v1/embeddings`, apiKeyOf(cfg), body, {
+				signal,
+				timeoutMs: TIMEOUT.tool,
+			});
 			if (!res.ok) return toolError(`Embeddings failed (${res.status}): ${res.error}`, { model });
 			const data = res.data?.data || [];
 			const lines = [`Model: ${model}`, `Inputs: ${parts.length}`, `Vectors: ${data.length}`];
@@ -1013,8 +1091,20 @@ function registerEmbedTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 						.join(", ")}${vec.length > 8 ? ", …" : ""}]`,
 				);
 			}
-			const details: Record<string, unknown> = { model, count: data.length, dimensions: data[0]?.embedding?.length };
-			if (params.full) details.embeddings = data.map((d: any) => d.embedding);
+			const details: Record<string, unknown> = {
+				model,
+				count: data.length,
+				dimensions: data[0]?.embedding?.length,
+			};
+			// Cap full vectors to avoid context blowups even when requested
+			if (params.full) {
+				const maxFull = 8;
+				details.embeddings = data.slice(0, maxFull).map((d: any) => d.embedding);
+				if (data.length > maxFull) {
+					details.embeddingsTruncated = true;
+					lines.push(`(full vectors capped at ${maxFull} of ${data.length})`);
+				}
+			}
 			return toolOk(lines.join("\n"), details);
 		},
 		renderResult(result, { expanded }, theme) {
@@ -1063,9 +1153,7 @@ function registerWebSearchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			const picked = resolveModel(cfg, cap, params.model);
 			if (!picked.ok) return toolError(picked.message, { requested: params.model });
 			const model = picked.id;
-			// 9Router /v1/search takes `model` as a *provider name* ("exa"), not the
-			// catalog id ("exa/search") — the suffixed form is rejected with
-			// "Unknown provider". Keep the catalog id for display and details.
+			// Wire: bare provider ("exa"), not catalog id ("exa/search")
 			const apiModel = model.replace(/\/search$/i, "");
 			onUpdate?.({ content: [{ type: "text", text: `Searching · ${apiModel}` }] });
 			const body: Record<string, unknown> = {
@@ -1076,7 +1164,10 @@ function registerWebSearchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			if (params.search_type) body.search_type = params.search_type;
 			if (params.country) body.country = params.country;
 			if (params.language) body.language = params.language;
-			const res = await postJson(`${endpointOf(cfg)}/v1/search`, apiKeyOf(cfg), body, signal);
+			const res = await postJson(`${endpointOf(cfg)}/v1/search`, apiKeyOf(cfg), body, {
+				signal,
+				timeoutMs: TIMEOUT.tool,
+			});
 			if (!res.ok) return toolError(`Search failed (${res.status}): ${res.error}`, { model, query: params.query });
 			const results = res.data?.results || res.data?.data || [];
 			const lines = [
@@ -1146,9 +1237,6 @@ function registerWebFetchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			const picked = resolveModel(cfg, cap, params.model);
 			if (!picked.ok) return toolError(picked.message, { requested: params.model });
 			const model = picked.id;
-			// 9Router /v1/web/fetch takes `model` as a *provider name* ("exa"), not the
-			// catalog id ("exa/fetch") — the suffixed form is rejected with
-			// "Unknown provider". Keep the catalog id for display and details.
 			const apiModel = model.replace(/\/fetch$/i, "");
 			if (!/^https?:\/\//i.test(params.url)) return toolError("url must be absolute http(s)");
 			onUpdate?.({ content: [{ type: "text", text: `Fetching · ${params.url}` }] });
@@ -1160,8 +1248,10 @@ function registerWebFetchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			if (params.max_characters != null) body.max_characters = params.max_characters;
 			const ep = endpointOf(cfg);
 			const key = apiKeyOf(cfg);
-			let res = await postJson(`${ep}/v1/web/fetch`, key, body, signal);
-			if (!res.ok && res.status === 404) res = await postJson(`${ep}/v1/fetch`, key, body, signal);
+			let res = await postJson(`${ep}/v1/web/fetch`, key, body, { signal, timeoutMs: TIMEOUT.tool });
+			if (!res.ok && res.status === 404) {
+				res = await postJson(`${ep}/v1/fetch`, key, body, { signal, timeoutMs: TIMEOUT.tool });
+			}
 			if (!res.ok) return toolError(`Fetch failed (${res.status}): ${res.error}`, { model, url: params.url });
 			const data = res.data || {};
 			const contentObj = data.content;
@@ -1194,10 +1284,6 @@ function registerWebFetchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 // ── Entry ───────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-	/**
-	 * Descriptions embed the current catalog, so re-register after every sync.
-	 * registerTool keys on tool name, so this replaces the previous definition.
-	 */
 	const registerAll = (cfg: ToolsConfigSlice) => {
 		registerImageTool(pi, cfg);
 		registerTtsTool(pi, cfg);
@@ -1211,19 +1297,18 @@ export default function (pi: ExtensionAPI) {
 	const applyFromDisk = () => applyToolActivation(pi, loadRaw());
 
 	pi.on("session_start", async (_event, ctx) => {
-		// Persist once to strip legacy stt/voice/ffmpeg keys from older installs
 		const cfg = saveRaw({});
 		applyFromDisk();
 		const enabled = CAPS.filter((c) => getCapState(cfg, c).enabled).length;
 		if (ctx.hasUI) {
+			const stale = isSyncStale(cfg.lastSync);
 			ctx.ui.setStatus(
 				"9router-tools",
-				ctx.ui.theme.fg("dim", `tools ${enabled}/${CAPS.length}`),
+				ctx.ui.theme.fg(stale ? "warning" : "dim", `tools ${enabled}/${CAPS.length}${stale ? " · stale" : ""}`),
 			);
 		}
 	});
 
-	// A sync changes which models exist, so rebuild the descriptions from the new catalog.
 	pi.events.on("9router:synced", () => {
 		registerAll(loadRaw());
 		applyFromDisk();
@@ -1238,9 +1323,14 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (!loadRaw().catalog?.length) {
 				ctx.ui.notify("Catalog empty — open /9router and sync models first.", "warning");
+			} else if (isSyncStale(loadRaw().lastSync)) {
+				ctx.ui.notify("Catalog is stale (>24h). Consider /9router → Sync models.", "warning");
 			}
 			await runToolsUI(pi, ctx);
 			applyFromDisk();
 		},
 	});
 }
+
+// Test helpers
+export { generateImages, loadImageRef, modelsForCap, getCapState };

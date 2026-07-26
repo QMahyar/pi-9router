@@ -24,9 +24,12 @@ pi install git:github.com/QMahyar/pi-9router
 
 ## 3. First run in pi
 
-1. **`/9router`** → **Connection** (endpoint / key) → **Sync models**  
+1. **`/9router`** → **Connection** (endpoint / key) → **Sync models (full catalog)**  
 2. **`/model`** → provider **9router**  
 3. **`/9router-tools`** → enable tools and set defaults  
+
+Use **Diagnose** if health or catalogs look wrong. **Quick sync** refreshes chat
+only and keeps the previous tool catalog.
 
 ## Env (optional)
 

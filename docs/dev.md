@@ -2,40 +2,67 @@
 
 ```text
 extensions/
-  9router.ts         # /9router — sync + chat provider
+  9router.ts         # /9router — sync + chat provider + diagnose
   9router-tools.ts   # /9router-tools + nr_* tools
+  lib/
+    shared.ts        # HTTP, timeouts, config merge (not an entry point)
+scripts/
+  e2e-test.ts        # live E2E against local 9Router
 ```
 
-- Core emits `9router:synced` after catalog refresh.  
-- Tools call `setActiveTools` so only enabled tools hit the model prompt.  
-- Shared config: `~/.pi/agent/9router.json`  
+- Core emits `9router:synced` after catalog refresh.
+- Tools call `setActiveTools` so only enabled tools hit the model prompt.
+- Shared config: `~/.pi/agent/9router.json`
 
-**Catalog shape.** `/v1/models[/kind]` returns only `{ id, object, owned_by }`, so sync
-follows up with `/v1/models/info?id=` per model (concurrency 8, best-effort) for `name`,
-`kind`, `endpoint`, and `params`. Entries record `namedByServer` when the name is the
-server's; the derived slug is only a fallback. The list `kind` stays the grouping bucket
-(`web`) and the server's precise kind lands in `detailKind` (`webSearch` / `webFetch`),
-which is what the web tool filters match on.
+**Catalog shape.** List endpoints may return only `{ id, object, owned_by }` or full
+`capabilities` (chat often does). Sync uses smart enrich: rows that already look
+rich skip `/v1/models/info`; thin rows (image, web, …) still get a lookup for
+`name`, `detailKind`, `endpoint`, and `params`.
+
+**Sync modes.** Full catalog (default) fetches chat/image/tts/embedding/web/
+image-to-text, enriches, probes voice TTS. Quick sync fetches chat only and keeps
+previous non-chat catalog entries so tools keep working.
+
+**STT** is not fetched (no STT tools in this package).
 
 **Synthetic entries.** `edge-tts` / `google-tts` are added locally (`synthetic: true`)
-after a `/v1/audio/speech` probe returns real audio. Keep the probe — these 502 behind a
-proxy, and listing dead models is worse than omitting them.
+after a `/v1/audio/speech` probe returns real audio.
 
-**Tool descriptions** embed the catalog ids, so `registerAll()` re-runs on
-`9router:synced`; `registerTool` keys on tool name, so re-registering replaces cleanly.
+**Tool descriptions** embed catalog ids (+ params when known); `registerAll()`
+re-runs on `9router:synced`.
 
-**Generated media stays out of the context by default.** `nr_image_generate` returns the
-saved path, not base64 (`attachImages` opts in). Tool results are resent every turn, so a
-1–2 MB image is ~675k tokens of permanent context — it overflows the *chat* model, which
-is unrelated to the image model that produced it. pi reads image files natively.
+**Images.** `nr_image_generate` loops `n` times on the binary path, supports optional
+`image_path` for edit/img2img, and returns a path by default (`attachImages` opts in).
 
-**`model` on the wire is not always the catalog id.** `/v1/images/generations`,
-`/v1/audio/speech` and `/v1/embeddings` take the full id (`nb/nanobanana-flash`), but
-`/v1/search` and `/v1/web/fetch` take a bare provider name — `exa`, not `exa/search`,
-which the server rejects with `Unknown provider`. The upstream skill doc puts it as
-"Provider IS the model". The tools strip the `/search` / `/fetch` suffix from the request
-body only, keeping the catalog id for display and `details`.
+**TTS.** Binary audio first; JSON `?response_format=json` only as fallback.
 
-Exported for testing: `fetchAllAndBuild`, `resolveModel`, `describeModels`, `CAPS`.
+**`model` on the wire** is not always the catalog id: search/fetch take a bare
+provider name (`exa`, not `exa/search`).
 
-Publish: `npm publish --access public` from package root (name `@qmahyar/pi-9router`).
+**Timeouts** (shared): health 8s · list 45s · info 12s · probe 20s · tools 120s.
+
+**Stale catalog:** lastSync older than 24h shows a warning in status / session footer.
+
+Exported for testing: `fetchAllAndBuild`, `diagnoseConnection`, `resolveModel`,
+`describeModels`, `CAPS`, `generateImages`.
+
+```bash
+# typecheck / bundle
+bun build extensions/9router.ts extensions/9router-tools.ts \
+  --target=node --external '*' --outdir "$LOCALAPPDATA/Temp/nrbuild"
+
+# live E2E (9Router must be running)
+bun run scripts/e2e-test.ts
+```
+
+**Local install (this machine):** copy loose files — do not `pi install` alongside them:
+
+```bash
+mkdir -p "$USERPROFILE/.pi/agent/extensions/lib"
+cp extensions/9router.ts extensions/9router-tools.ts "$USERPROFILE/.pi/agent/extensions/"
+cp extensions/lib/shared.ts "$USERPROFILE/.pi/agent/extensions/lib/"
+```
+
+Then `/reload` in pi.
+
+Publish: `npm publish --access public --otp=…` from package root.

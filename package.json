@@ -1,6 +1,6 @@
 {
   "name": "@qmahyar/pi-9router",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Connect pi to 9Router — multi-provider chat models plus image, speech, search, and fetch tools",
   "keywords": [
     "pi-package",
@@ -34,7 +34,8 @@
   ],
   "pi": {
     "extensions": [
-      "./extensions"
+      "./extensions/9router.ts",
+      "./extensions/9router-tools.ts"
     ]
   },
   "peerDependencies": {
