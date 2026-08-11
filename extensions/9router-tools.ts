@@ -13,8 +13,9 @@
  * Speech-to-text / mic input is intentionally not included — use a dedicated
  * OS dictation app (e.g. Superwhisper, Spokenly) for voice → editor.
  *
- * Each tool's description carries the ids available for its capability, and a
- * `model` argument is resolved against the catalog before any request goes out.
+ * Tool descriptions stay compact — they name the configured default model, not
+ * the full catalog. A `model` argument is resolved against the catalog before
+ * any request goes out; unknown ids are rejected with the available list.
  *
  * Wire convention: /v1/images/generations, /v1/audio/speech, /v1/embeddings take
  * the full catalog id; /v1/search and /v1/web/fetch take a bare provider name.
@@ -22,18 +23,20 @@
  * Shared config: ~/.pi/agent/9router.json
  */
 
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import {
+	truncateHead,
+	truncateTail,
+	formatSize,
+	type ExtensionAPI,
+	type ExtensionContext,
+	type Theme,
+} from "@earendil-works/pi-coding-agent";
 import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import {
-	existsSync,
-	mkdirSync,
-	readFileSync,
-	writeFileSync,
-	statSync,
-} from "node:fs";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, extname, isAbsolute, join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
+import { tmpdir } from "node:os";
 import {
 	CONFIG_PATH,
 	DEFAULT_OUTPUT_DIR,
@@ -310,8 +313,38 @@ export function describeModels(cfg: ToolsConfigSlice, cap: CapDef): string {
 	return `Available: ${parts.join("; ")}.`;
 }
 
-function withModels(cfg: ToolsConfigSlice, cap: CapDef, base: string): string {
-	return `${base}\n\n${describeModels(cfg, cap)}\nPass one of these exact ids as \`model\`, or omit \`model\` to use the configured default.`;
+/**
+ * Compact per-tool model hint for descriptions. Intentionally does NOT embed
+ * the full catalog (repeating ~14 ids + voice lists in every tool description
+ * bloats the system prompt). Models are resolved at execution time; unknown
+ * ids are rejected with the available list (see resolveModel), and
+ * /9router-tools browses the catalog interactively.
+ */
+function withModelHint(cfg: ToolsConfigSlice, cap: CapDef, base: string): string {
+	const models = modelsForCap(cfg, cap);
+	const n = models.length;
+	const saved = getCapState(cfg, cap).model?.trim();
+	const usable =
+		saved && (models.some((m) => m.id === saved) || isVoiceProviderId(saved))
+			? saved
+			: undefined;
+	const def = usable || models[0]?.id;
+
+	const lines = [base, ""];
+	lines.push(
+		n
+			? `Default model: ${def ?? "(none set)"} (${n} available).`
+			: "No models synced yet — run /9router → Sync models first.",
+	);
+	lines.push(
+		"Omit `model` to use the default. When the user names a specific model, pass its exact catalog id (browse via /9router-tools); a fuzzy name is resolved or rejected with the available list.",
+	);
+	if (cap.id === "tts") {
+		lines.push(
+			"edge-tts and google-tts accept arbitrary voice ids, e.g. edge-tts/en-US-AriaNeural, google-tts/en.",
+		);
+	}
+	return lines.join("\n");
 }
 
 function ambiguous(want: string, matches: CatalogEntry[]): string {
@@ -323,8 +356,8 @@ function ambiguous(want: string, matches: CatalogEntry[]): string {
 
 // ── File helpers ────────────────────────────────────────────────
 
-function ensureDir(dir: string) {
-	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+async function ensureDir(dir: string) {
+	await mkdir(dir, { recursive: true });
 }
 
 function slug(s: string, max = 40): string {
@@ -343,10 +376,10 @@ function stamp(): string {
 	return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 }
 
-function writeBytes(dir: string, name: string, bytes: Uint8Array): string {
-	ensureDir(dir);
+async function writeBytes(dir: string, name: string, bytes: Uint8Array): Promise<string> {
+	await ensureDir(dir);
 	const path = join(dir, name);
-	writeFileSync(path, bytes);
+	await writeFile(path, bytes);
 	return path;
 }
 
@@ -379,8 +412,11 @@ function decodeDataUrlOrB64(raw: string): { bytes: Uint8Array; ext: string } | n
 	}
 }
 
-/** Resolve a local image path for edit/reference; return base64 data URL or null. */
-function loadImageRef(pathOrData: string, cwd: string): string | null {
+/**
+ * Resolve a local image path for edit/reference; return base64 data URL or null.
+ * Strips a leading "@" (some models paste @ into path args) before resolving.
+ */
+async function loadImageRef(pathOrData: string, cwd: string): Promise<string | null> {
 	const raw = pathOrData.trim();
 	if (!raw) return null;
 	if (raw.startsWith("data:image/")) return raw;
@@ -402,10 +438,10 @@ function loadImageRef(pathOrData: string, cwd: string): string | null {
 			/* fall through to path */
 		}
 	}
-	const abs = isAbsolute(raw) ? raw : resolve(cwd, raw);
-	if (!existsSync(abs)) return null;
+	const target = raw.startsWith("@") ? raw.slice(1) : raw;
+	const abs = isAbsolute(target) ? target : resolve(cwd, target);
 	try {
-		const bytes = readFileSync(abs);
+		const bytes = await readFile(abs);
 		const ext = extname(abs).toLowerCase();
 		const media =
 			ext === ".jpg" || ext === ".jpeg"
@@ -421,12 +457,27 @@ function loadImageRef(pathOrData: string, cwd: string): string | null {
 	}
 }
 
-function toolError(message: string, details: Record<string, unknown> = {}) {
-	return {
-		content: [{ type: "text" as const, text: message }],
-		details,
-		isError: true as const,
-	};
+/**
+ * Thrown from execute() so pi marks the tool result as failed. Per the pi
+ * docs, returning `{ isError: true }` never sets the error flag — only
+ * throwing does. Details are folded into the message so they still reach the
+ * model (e.g. `requested`, `model`, `url`).
+ */
+class ToolError extends Error {
+	readonly details: Record<string, unknown>;
+	constructor(message: string, details: Record<string, unknown> = {}) {
+		super(message);
+		this.name = "ToolError";
+		this.details = details;
+	}
+}
+
+function toolError(message: string, details: Record<string, unknown> = {}): never {
+	const keys = Object.keys(details);
+	const suffix = keys.length
+		? ` — ${keys.map((k) => `${k}: ${String(details[k])}`).join(", ")}`
+		: "";
+	throw new ToolError(message + suffix, details);
 }
 
 function toolOk(text: string, details: Record<string, unknown> = {}) {
@@ -664,6 +715,30 @@ function textFromResult(result: { content?: Array<{ type: string; text?: string 
 	);
 }
 
+// ── Output truncation (docs-mandated: default 50KB / 2000 lines) ────────────
+
+async function writeTempArtifact(text: string, prefix: string): Promise<string> {
+	const name = `${prefix}-${stamp()}-${randomBytes(3).toString("hex")}.txt`;
+	const path = join(tmpdir(), name);
+	await writeFile(path, text, "utf8");
+	return path;
+}
+
+/** Keep head/tail within the default limits; save the full text to a temp file when cut. */
+async function truncateResult(
+	text: string,
+	prefix: string,
+	mode: "head" | "tail",
+): Promise<string> {
+	const t = mode === "head" ? truncateHead(text) : truncateTail(text);
+	if (!t.truncated) return text;
+	const fullPath = await writeTempArtifact(text, prefix);
+	return (
+		t.content +
+		`\n\n[Output truncated: ${t.outputLines} of ${t.totalLines} lines (${formatSize(t.outputBytes)} of ${formatSize(t.totalBytes)}). Full output saved to: ${fullPath}]`
+	);
+}
+
 // ── Image generation (n + optional edit ref) ────────────────────
 
 async function generateImages(opts: {
@@ -708,7 +783,7 @@ async function generateImages(opts: {
 					? filename.replace(/[^\w.\-]+/g, "_")
 					: null) ||
 				`img-${stamp()}-${slug(prompt)}-${i}-${randomBytes(2).toString("hex")}${ext}`;
-			saved.push(writeBytes(outDir, name, bin.bytes));
+			saved.push(await writeBytes(outDir, name, bin.bytes));
 			continue;
 		}
 
@@ -745,7 +820,7 @@ async function generateImages(opts: {
 						filename?.replace(/[^\w.\-]+/g, "_") && (res2.data.data || []).length === 1
 							? filename.replace(/[^\w.\-]+/g, "_")
 							: `img-${stamp()}-${slug(prompt)}-${j}-${randomBytes(2).toString("hex")}${ext}`;
-					saved.push(writeBytes(outDir, nm, dl.bytes));
+					saved.push(await writeBytes(outDir, nm, dl.bytes));
 				}
 				// url response may already include n images — done
 				break;
@@ -759,7 +834,7 @@ async function generateImages(opts: {
 					filename?.replace(/[^\w.\-]+/g, "_") && rows.length === 1 && count === 1
 						? filename.replace(/[^\w.\-]+/g, "_")
 						: `img-${stamp()}-${slug(prompt)}-${i}-${j}-${randomBytes(2).toString("hex")}${dec.ext}`;
-				saved.push(writeBytes(outDir, nm, dec.bytes));
+				saved.push(await writeBytes(outDir, nm, dec.bytes));
 			}
 			// If b64 returned multiple for n:1, we still only wanted one iteration worth
 			if (rows.length > 1) break;
@@ -789,7 +864,7 @@ async function generateImages(opts: {
 			if (!dl) continue;
 			const ext = extFromContentType(dl.contentType, ".png");
 			const nm = `img-${stamp()}-${slug(prompt)}-${i}-${j}-${randomBytes(2).toString("hex")}${ext}`;
-			saved.push(writeBytes(outDir, nm, dl.bytes));
+			saved.push(await writeBytes(outDir, nm, dl.bytes));
 		}
 		if ((res2.data?.data || []).length > 1) break;
 	}
@@ -804,7 +879,7 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 	pi.registerTool({
 		name: cap.tool,
 		label: "Image",
-		description: withModels(
+		description: withModelHint(
 			cfg,
 			cap,
 			"Generate an image through 9Router and save it to disk. Best for icons, logos, illustrations, UI mockups, and concept art. Optional image_path enables edit/img2img when the model supports it. Returns the saved file path; the image itself is not embedded in the result by default.",
@@ -813,7 +888,7 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 		promptGuidelines: [
 			"Call nr_image_generate to create images, icons, logos, illustrations, or mockups.",
 			"Write a detailed prompt (subject, style, colors, composition).",
-			"Omit model unless the user names a specific image model; when they do, use an exact id from the tool description. Optional size, quality, n (1–4), filename, image_path (local path for edit/img2img).",
+			"Omit model unless the user names a specific image model; when they do, pass its exact catalog id (browse via /9router-tools if unsure). Optional size, quality, n (1–4), filename, image_path (local path for edit/img2img).",
 			"Tell the user the saved file path from the tool result.",
 			"The image is not embedded in the result — read the returned path if you need to see it.",
 		],
@@ -830,6 +905,18 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 				}),
 			),
 		}),
+		prepareArguments(args) {
+			if (!args || typeof args !== "object") return args;
+			const input = args as Record<string, unknown>;
+			// Resumed/legacy sessions may pass camelCase — fold into the schema.
+			if (input.image_path === undefined && typeof input.imagePath === "string") {
+				const rest: Record<string, unknown> = { ...input };
+				delete rest.imagePath;
+				rest.image_path = input.imagePath;
+				return rest;
+			}
+			return args;
+		},
 		async execute(_id, params, signal, onUpdate, ctx) {
 			const cfg = loadRaw();
 			const blocked = needCap(cfg, cap);
@@ -845,7 +932,7 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 
 			let imageDataUrl: string | undefined;
 			if (params.image_path?.trim()) {
-				const loaded = loadImageRef(params.image_path, ctx.cwd);
+				const loaded = await loadImageRef(params.image_path, ctx.cwd);
 				if (!loaded) {
 					return toolError(`Could not read image_path: ${params.image_path}`, {
 						image_path: params.image_path,
@@ -900,9 +987,9 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			if (shouldAttachImage(cfg)) {
 				try {
 					const first = saved[0];
-					const st = statSync(first);
+					const st = await stat(first);
 					if (st.size > 0) {
-						const bytes = readFileSync(first);
+						const bytes = await readFile(first);
 						const ext = extname(first).toLowerCase();
 						const mediaType =
 							ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" : ext === ".webp" ? "image/webp" : "image/png";
@@ -948,7 +1035,7 @@ function registerTtsTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 	pi.registerTool({
 		name: cap.tool,
 		label: "Speech",
-		description: withModels(
+		description: withModelHint(
 			cfg,
 			cap,
 			"Convert text to speech through 9Router and save an audio file. Use for narration or voiceover.",
@@ -1018,7 +1105,7 @@ function registerTtsTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			if (!bytes?.length) return toolError("Empty audio.", { model });
 			const name =
 				params.filename?.replace(/[^\w.\-]+/g, "_") || `tts-${stamp()}-${slug(params.input)}${ext}`;
-			const path = writeBytes(outDir, name, bytes);
+			const path = await writeBytes(outDir, name, bytes);
 			return toolOk(
 				[
 					"Speech saved.",
@@ -1044,7 +1131,7 @@ function registerEmbedTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 	pi.registerTool({
 		name: cap.tool,
 		label: "Embed",
-		description: withModels(
+		description: withModelHint(
 			cfg,
 			cap,
 			"Create text embeddings through 9Router for RAG or similarity. Returns dimensions and a short preview by default. Set full=true only when full vector arrays are required.",
@@ -1127,7 +1214,7 @@ function registerWebSearchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 	pi.registerTool({
 		name: cap.tool,
 		label: "Search",
-		description: withModels(
+		description: withModelHint(
 			cfg,
 			cap,
 			"Search the web through 9Router. Returns titles, URLs, and snippets. For full page text of a known URL, use nr_web_fetch.",
@@ -1189,7 +1276,8 @@ function registerWebSearchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 				lines.push(JSON.stringify(res.data, null, 2).slice(0, 8000));
 			}
 			if (res.data?.answer) lines.push("Answer:", String(res.data.answer));
-			return toolOk(lines.join("\n").trim(), {
+			const text = await truncateResult(lines.join("\n").trim(), "web-search", "head");
+			return toolOk(text, {
 				model,
 				query: params.query,
 				resultCount: Array.isArray(results) ? results.length : 0,
@@ -1214,7 +1302,7 @@ function registerWebFetchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 	pi.registerTool({
 		name: cap.tool,
 		label: "Fetch",
-		description: withModels(
+		description: withModelHint(
 			cfg,
 			cap,
 			"Fetch a URL as markdown, text, or HTML through 9Router. Use when you already have a URL. For discovery, use nr_web_search first.",
@@ -1269,7 +1357,8 @@ function registerWebFetchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 				.filter(Boolean)
 				.join("\n");
 			const bodyText = textBody || JSON.stringify(data, null, 2).slice(0, 12000);
-			return toolOk(`${header}\n\n${bodyText}`, {
+			const text = await truncateResult(`${header}\n\n${bodyText}`, "web-fetch", "head");
+			return toolOk(text, {
 				model,
 				url: params.url,
 				title: data.title,

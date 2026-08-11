@@ -32,7 +32,26 @@ Do **not** put machine-only paths or secrets here — those stay in gitignored `
 ### Notes
 
 - Local install remains **loose files** under `~/.pi/agent/extensions/` (see `AGENTS.md`). After pulls, copy `extensions/**` including `lib/shared.ts`, then `/reload` in pi.
-- `1.2.2` is on **git `master`** (`92fda79`). Confirm npm with `npm view @qmahyar/pi-9router version` — publish may still need OTP if registry lags behind git.
+
+---
+
+## [1.2.3] — 2026-08-12
+
+### Added
+
+- `refreshModels` hook on the `9router` chat provider — pi-side model refresh (e.g. `pi update --models`) re-fetches the live chat list and falls back to cached models on error; chat refresh no longer needs a manual /9router sync.
+- `prepareArguments` on `nr_image_generate` (camelCase `imagePath` from resumed sessions folds into `image_path`); leading `@` stripped from `image_path` paths.
+- Output truncation for `nr_web_search` / `nr_web_fetch` results (50KB / 2000 lines; full text saved to a temp file with a hint in the result).
+
+### Changed
+
+- Tool descriptions no longer embed the full model catalog — they name the configured default + count; unknown ids are still rejected at execution with the available list (browse via `/9router-tools`).
+- Tool file I/O moved off sync `fs` (async `node:fs/promises`); `normalizeEndpoint` tolerates scheme-less endpoints (`localhost:20128` → `http://…`).
+- `peerDependencies` now lists `@earendil-works/pi-tui` and `typebox` (both imported at runtime) alongside `@earendil-works/pi-coding-agent`.
+
+### Fixed
+
+- Tool errors now **throw** from `execute()` — per pi docs a returned `isError: true` never sets the error flag, so failures were not being marked as errors in the session/UI.
 
 ### Planned / ideas
 

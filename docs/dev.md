@@ -33,8 +33,14 @@ previous non-chat catalog entries so tools keep working.
 **Synthetic entries.** `edge-tts` / `google-tts` are added locally (`synthetic: true`)
 after a `/v1/audio/speech` probe returns real audio.
 
-**Tool descriptions** embed catalog ids (+ params when known); `registerAll()`
-re-runs on `9router:synced`.
+**Tool descriptions** stay compact (configured default model + count, not the
+full catalog); `registerAll()` re-runs on `9router:synced`. Tool failures
+**throw** from `execute()` (a returned `isError: true` is ignored by pi — only
+throwing sets the error flag). `nr_web_search`/`nr_web_fetch` results are
+truncated to 50KB/2000 lines with the full text saved to a temp file. The chat
+provider also exposes a live `refreshModels` hook (falls back to cached models on
+error), so pi-side refresh flows like `pi update --models` re-fetch the chat list
+without a manual /9router sync.
 
 **Images.** `nr_image_generate` loops `n` times on the binary path, supports optional
 `image_path` for edit/img2img, and returns a path by default (`attachImages` opts in).

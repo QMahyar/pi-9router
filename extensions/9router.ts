@@ -15,6 +15,11 @@
  * edge-tts / google-tts are noAuth voice providers with no list-endpoint entry;
  * they are probed with a short synthesis call and only added when they respond.
  *
+ * The registered provider also exposes a live `refreshModels` hook, so pi-side
+ * refresh flows (e.g. `pi update --models`) re-fetch the chat list without a
+ * manual /9router sync. On failure it falls back to the cached models so a
+ * refresh never wipes the provider.
+ *
  * Config: ~/.pi/agent/9router.json
  * Env:    NINEROUTER_URL, NINEROUTER_KEY
  */
@@ -918,6 +923,15 @@ function registerWithPi(pi: ExtensionAPI, config: Config, chatModels: PiModelDef
 			...(m.compat ? { compat: m.compat } : {}),
 			...(m.thinkingLevelMap ? { thinkingLevelMap: m.thinkingLevelMap } : {}),
 		})),
+		// Live discovery hook (docs/extensions.md): pi calls this during model
+		// refresh. Quick chat-only fetch — no enrich, no config write. Errors fall
+		// back to the cached models so the provider is never emptied by a bad
+		// refresh. The durable catalog stays owned by the /9router sync flow.
+		async refreshModels(context: { signal?: AbortSignal } & Record<string, unknown>) {
+			const list = await fetchKind(endpoint, apiKey, "chat", context?.signal);
+			if (!list.ok || !list.models.length) return chatModels;
+			return list.models.map((m) => toPiModel(m));
+		},
 	});
 }
 
@@ -1276,7 +1290,7 @@ async function runNineRouterUI(pi: ExtensionAPI, ctx: ExtensionContext): Promise
 
 // ── Extension entry ─────────────────────────────────────────────
 
-export default async function (pi: ExtensionAPI) {
+export default function (pi: ExtensionAPI) {
 	const config = loadConfig();
 
 	// Register cached chat models at startup so /model works immediately.

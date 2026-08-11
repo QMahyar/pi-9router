@@ -96,7 +96,11 @@ export function saveJsonMerge(patch: Record<string, unknown>): Record<string, un
 }
 
 export function normalizeEndpoint(endpoint?: string): string {
-	return (endpoint || process.env.NINEROUTER_URL || DEFAULT_ENDPOINT).replace(/\/$/, "");
+	const raw = (endpoint || process.env.NINEROUTER_URL || DEFAULT_ENDPOINT).trim();
+	const trimmed = raw.replace(/\/+$/, "");
+	// Tolerate scheme-less input like "localhost:20128" (assume http).
+	if (/^[a-z][a-z0-9+.\-]*:\/\//i.test(trimmed)) return trimmed;
+	return `http://${trimmed}`;
 }
 
 export function resolveApiKey(apiKey?: string): string {

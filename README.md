@@ -60,9 +60,10 @@ are real — `openrouter/openai/tts-1-hd` shows as **TTS-1 HD**, not *"Openai/Tt
 - **Quick sync** — chat only (keeps previous image/tts/web catalog)  
 - **Diagnose** — health, per-kind latency, sample info, voice probes  
 
-Each tool description lists available ids (and params when known). A `model`
-argument is resolved locally first — `nano-banana` maps to a real id or fails with
-candidates listed, instead of `No credentials for provider: nano`.
+Tool descriptions stay compact: they name the configured default model, not the
+whole catalog. A `model` argument is resolved locally first — `nano-banana` maps
+to a real id or fails with candidates listed, instead of `No credentials for
+provider: nano`. Browse the full catalog via `/9router-tools`.
 
 **edge-tts** / **google-tts** are free and absent from `/v1/models/tts`. Full sync
 probes them and only adds live ones.
