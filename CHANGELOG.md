@@ -37,7 +37,7 @@ Do **not** put machine-only paths or secrets here — those stay in gitignored `
 
 ## [1.2.4] — 2026-08-12
 
-**Git:** pending (recorded in follow-up commit) · **npm:** pending
+**Git:** `b381da0` · **npm:** `1.2.4` published (`latest`; global npmrc token, no 2FA prompt).
 
 ### Fixed
 
