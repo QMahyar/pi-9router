@@ -31,7 +31,22 @@ Do **not** put machine-only paths or secrets here — those stay in gitignored `
 
 ### Notes
 
-- Local install remains **loose files** under `~/.pi/agent/extensions/` (see `AGENTS.md`). After pulls, copy `extensions/**` including `lib/shared.ts`, then `/reload` in pi.
+- Nothing in flight — 1.2.4 shipped the filename-extension fix.
+
+---
+
+## [1.2.4] — 2026-08-12
+
+**Git:** pending (recorded in follow-up commit) · **npm:** pending
+
+### Fixed
+
+- `filename` without an extension now gets the extension detected from the response content-type — `nr_image_generate` (`.png`/`.jpg`/`.webp`/…) and `nr_tts` (`.mp3`/`.wav`/…): `demo-bolt-icon` → `demo-bolt-icon.jpg`, `demo-tts-fa` → `demo-tts-fa.mp3`. Explicit extensions (`fix.png`, `voice.wav`) are left untouched; multi-image (`n>1`) still uses generated `img-…` names.
+
+### Notes
+
+- Local install is now the published npm package (`npm:@qmahyar/pi-9router` via `pi update`) — the loose-file copy steps in `AGENTS.md` are obsolete for this machine.
+- Server-side at release time: `nb/nanobanana-flash` returned 502 “credits insufficient” during e2e (account/upstream, not the package); `/v1/models/web` still lists 0 web models, so `nr_web_search`/`nr_web_fetch` stay offline until the server has web providers + a full sync.
 
 ---
 

@@ -395,6 +395,11 @@ function extFromContentType(ct: string, fallback: string): string {
 	return fallback;
 }
 
+/** Append `ext` to a user-provided file name when it lacks any extension. */
+function withExt(name: string, ext: string): string {
+	return ext && extname(name) === "" ? name + ext : name;
+}
+
 function decodeDataUrlOrB64(raw: string): { bytes: Uint8Array; ext: string } | null {
 	const m = raw.match(/^data:(image\/[a-z0-9.+-]+);base64,(.+)$/i);
 	if (m) {
@@ -780,7 +785,7 @@ async function generateImages(opts: {
 			const ext = extFromContentType(bin.contentType, ".png");
 			const name =
 				(filename?.replace(/[^\w.\-]+/g, "_") && count === 1
-					? filename.replace(/[^\w.\-]+/g, "_")
+					? withExt(filename.replace(/[^\w.\-]+/g, "_"), ext)
 					: null) ||
 				`img-${stamp()}-${slug(prompt)}-${i}-${randomBytes(2).toString("hex")}${ext}`;
 			saved.push(await writeBytes(outDir, name, bin.bytes));
@@ -818,7 +823,7 @@ async function generateImages(opts: {
 					const ext = extFromContentType(dl.contentType, ".png");
 					const nm =
 						filename?.replace(/[^\w.\-]+/g, "_") && (res2.data.data || []).length === 1
-							? filename.replace(/[^\w.\-]+/g, "_")
+							? withExt(filename.replace(/[^\w.\-]+/g, "_"), ext)
 							: `img-${stamp()}-${slug(prompt)}-${j}-${randomBytes(2).toString("hex")}${ext}`;
 					saved.push(await writeBytes(outDir, nm, dl.bytes));
 				}
@@ -832,7 +837,7 @@ async function generateImages(opts: {
 				if (!dec) continue;
 				const nm =
 					filename?.replace(/[^\w.\-]+/g, "_") && rows.length === 1 && count === 1
-						? filename.replace(/[^\w.\-]+/g, "_")
+						? withExt(filename.replace(/[^\w.\-]+/g, "_"), dec.ext)
 						: `img-${stamp()}-${slug(prompt)}-${i}-${j}-${randomBytes(2).toString("hex")}${dec.ext}`;
 				saved.push(await writeBytes(outDir, nm, dec.bytes));
 			}
@@ -1104,7 +1109,9 @@ function registerTtsTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 
 			if (!bytes?.length) return toolError("Empty audio.", { model });
 			const name =
-				params.filename?.replace(/[^\w.\-]+/g, "_") || `tts-${stamp()}-${slug(params.input)}${ext}`;
+				(params.filename?.replace(/[^\w.\-]+/g, "_") &&
+					withExt(params.filename.replace(/[^\w.\-]+/g, "_"), ext)) ||
+				`tts-${stamp()}-${slug(params.input)}${ext}`;
 			const path = await writeBytes(outDir, name, bytes);
 			return toolOk(
 				[

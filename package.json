@@ -1,6 +1,6 @@
 {
   "name": "@qmahyar/pi-9router",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "description": "Connect pi to 9Router — multi-provider chat models plus image, speech, search, and fetch tools",
   "keywords": [
     "pi-package",
