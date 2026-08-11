@@ -37,6 +37,8 @@ Do **not** put machine-only paths or secrets here — those stay in gitignored `
 
 ## [1.2.3] — 2026-08-12
 
+**Git:** `ac8efed` · **npm:** `1.2.3` published (OTP via global npmrc token, no 2FA prompt).
+
 ### Added
 
 - `refreshModels` hook on the `9router` chat provider — pi-side model refresh (e.g. `pi update --models`) re-fetches the live chat list and falls back to cached models on error; chat refresh no longer needs a manual /9router sync.
