@@ -436,7 +436,12 @@ export function asCaps(raw: RemoteModel["capabilities"]): ModelCapabilities | un
 		}
 		return out;
 	}
-	return raw;
+	const out: ModelCapabilities = { ...raw };
+	// Live resolvers (e.g. kiro) report `thinking` instead of `reasoning`.
+	if (out.reasoning === undefined && out.thinking != null) {
+		out.reasoning = out.thinking === true || out.thinking === "true";
+	}
+	return out;
 }
 
 /**

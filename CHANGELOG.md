@@ -31,7 +31,22 @@ Do **not** put machine-only paths or secrets here — those stay in gitignored `
 
 ### Notes
 
-- Nothing in flight — 1.2.4 shipped the filename-extension fix.
+- Nothing in flight — 1.2.5 shipped the model-metadata fix.
+
+---
+
+## [1.2.5] — 2026-08-13
+
+### Fixed
+
+- Chat model metadata (context window, max output, vision, reasoning, thinking format) was wrong for models whose `/v1/models` list row carries no `contextWindow`/`maxOutput` — live-resolver providers (kiro `kr/*`) and combos. They registered with the flat 128K/32K fallback, e.g. `kr/claude-sonnet-4` (200K) and `kr/qwen3-coder-next` (1M). Added a pattern-based fallback table mirroring 9Router's own resolver (`open-sse/providers/capabilities.js` → `getCapabilitiesForModel`, values merged over its 200K/64K floor) — `MODEL_PATTERN_CAPS` + `fillModelCaps` in `extensions/9router.ts`. Only **missing** fields are filled; explicit server caps always win. Applied to pi registration (`toPiModel`), the browse catalog, and `refreshModels`.
+- Kiro reports `thinking` (not `reasoning`) in capabilities — `asCaps` in `extensions/lib/shared.ts` now maps `thinking` → `reasoning`, so `kr/*-thinking` variants register with reasoning on and plain variants keep the server's explicit `false`.
+
+### Notes
+
+- After update: `/reload` in pi, then re-sync via `/9router` → Sync (or `pi update --models`) so cached `~/.pi/agent/9router.json` picks up corrected metadata (already regenerated locally).
+- e2e: 23/24 pass — the image failure is the known server-side `nanobanana-flash` "credits insufficient" 502, unrelated.
+- Source of truth for the pattern table: `open-sse/providers/capabilities.js` in the 9router repo — re-check on server updates.
 
 ---
 

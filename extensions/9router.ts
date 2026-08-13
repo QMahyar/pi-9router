@@ -214,6 +214,114 @@ function looksReasoning(id: string, caps?: ModelCapabilities): boolean {
 	return /thinking|reasoner|reason|-r1\b|o1\b|o3\b|o4\b/.test(s);
 }
 
+/**
+ * Fallback capability table mirroring 9Router's own resolver
+ * (open-sse/providers/capabilities.js → getCapabilitiesForModel) for models
+ * whose /v1/models list row omits contextWindow/maxOutput (live-resolver
+ * providers like kiro/kr, combos). Values are the server's resolved caps
+ * (its DEFAULT_CAPABILITIES floor 200000/64000 merged with each pattern).
+ * Only missing fields are filled — explicit server caps always win.
+ */
+const MODEL_PATTERN_CAPS: Array<{
+	pattern: string;
+	caps: Partial<ModelCapabilities>;
+}> = [
+	// ── Claude ──
+	{ pattern: "*claude*opus-5*", caps: { vision: true, reasoning: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 } },
+	{ pattern: "*claude*opus-4.6*", caps: { vision: true, reasoning: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 } },
+	{ pattern: "*claude*opus-4.7*", caps: { vision: true, reasoning: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 } },
+	{ pattern: "*claude*opus-4.8*", caps: { vision: true, reasoning: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 } },
+	{ pattern: "*claude*sonnet-4.6*", caps: { vision: true, reasoning: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 } },
+	{ pattern: "*claude*sonnet-4.7*", caps: { vision: true, reasoning: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 } },
+	{ pattern: "*claude*sonnet-5*", caps: { vision: true, reasoning: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 } },
+	{ pattern: "*claude*haiku*", caps: { vision: true, reasoning: true, thinkingFormat: "claude-budget", contextWindow: 200000, maxOutput: 64000 } },
+	{ pattern: "*claude*opus*", caps: { vision: true, reasoning: true, thinkingFormat: "claude-budget", contextWindow: 200000, maxOutput: 64000 } },
+	{ pattern: "*claude*sonnet*", caps: { vision: true, reasoning: true, thinkingFormat: "claude-budget", contextWindow: 200000, maxOutput: 64000 } },
+	{ pattern: "*claude*", caps: { vision: true, reasoning: true, thinkingFormat: "claude-budget", contextWindow: 200000, maxOutput: 64000 } },
+	// ── Gemini ──
+	{ pattern: "*gemini-3*", caps: { vision: true, reasoning: true, thinkingFormat: "gemini-level", contextWindow: 1048576, maxOutput: 65536 } },
+	{ pattern: "*gemini-2.5*", caps: { vision: true, reasoning: true, thinkingFormat: "gemini-budget", contextWindow: 1048576, maxOutput: 65536 } },
+	{ pattern: "*gemini-2*", caps: { vision: true, contextWindow: 1048576, maxOutput: 65536 } },
+	{ pattern: "*gemini*", caps: { vision: true, contextWindow: 1048576, maxOutput: 64000 } },
+	{ pattern: "*gemma*", caps: { vision: true, contextWindow: 128000, maxOutput: 64000 } },
+	// ── OpenAI GPT / o-series ──
+	{ pattern: "*gpt-5*", caps: { vision: true, reasoning: true, thinkingFormat: "openai", contextWindow: 400000, maxOutput: 128000 } },
+	{ pattern: "*gpt-4o*", caps: { vision: true, contextWindow: 128000, maxOutput: 16384 } },
+	{ pattern: "*gpt-4.1*", caps: { vision: true, contextWindow: 1000000, maxOutput: 32768 } },
+	{ pattern: "*gpt-4*", caps: { contextWindow: 128000, maxOutput: 64000 } },
+	{ pattern: "*gpt-oss*", caps: { reasoning: true, thinkingFormat: "openai", contextWindow: 128000, maxOutput: 64000 } },
+	{ pattern: "*o1*", caps: { vision: true, reasoning: true, thinkingFormat: "openai", contextWindow: 200000, maxOutput: 100000 } },
+	{ pattern: "*o3*", caps: { vision: true, reasoning: true, thinkingFormat: "openai", contextWindow: 200000, maxOutput: 100000 } },
+	{ pattern: "*o4*", caps: { vision: true, reasoning: true, thinkingFormat: "openai", contextWindow: 200000, maxOutput: 100000 } },
+	// ── Grok ──
+	{ pattern: "*grok-4.5*", caps: { vision: true, reasoning: true, thinkingFormat: "openai", contextWindow: 500000, maxOutput: 64000 } },
+	{ pattern: "*grok-4*", caps: { vision: true, reasoning: true, thinkingFormat: "openai", contextWindow: 256000, maxOutput: 64000 } },
+	{ pattern: "*grok*", caps: { vision: true, reasoning: true, thinkingFormat: "openai", contextWindow: 256000, maxOutput: 64000 } },
+	// ── Qwen ──
+	{ pattern: "*qwen*coder*", caps: { reasoning: true, thinkingFormat: "qwen", contextWindow: 1000000, maxOutput: 64000 } },
+	{ pattern: "*qwen3.5*", caps: { vision: true, reasoning: true, thinkingFormat: "qwen", contextWindow: 1000000, maxOutput: 65536 } },
+	{ pattern: "*qwen3.6*", caps: { vision: true, reasoning: true, thinkingFormat: "qwen", contextWindow: 1000000, maxOutput: 65536 } },
+	{ pattern: "*qwen3.7*", caps: { vision: true, reasoning: true, thinkingFormat: "qwen", contextWindow: 1000000, maxOutput: 65536 } },
+	{ pattern: "*qwen*max*", caps: { reasoning: true, thinkingFormat: "qwen", contextWindow: 1000000, maxOutput: 65536 } },
+	{ pattern: "*qwen*", caps: { reasoning: true, thinkingFormat: "qwen", contextWindow: 262144, maxOutput: 64000 } },
+	// ── Kimi ──
+	{ pattern: "*kimi*k2*", caps: { vision: true, reasoning: true, thinkingFormat: "kimi", contextWindow: 262144, maxOutput: 262144 } },
+	{ pattern: "*kimi*", caps: { reasoning: true, thinkingFormat: "kimi", contextWindow: 262144, maxOutput: 64000 } },
+	// ── GLM / Z.ai ──
+	{ pattern: "*glm-5*", caps: { reasoning: true, thinkingFormat: "zai", contextWindow: 200000, maxOutput: 128000 } },
+	{ pattern: "*glm-4.7*", caps: { reasoning: true, thinkingFormat: "zai", contextWindow: 200000, maxOutput: 128000 } },
+	{ pattern: "*glm*", caps: { reasoning: true, thinkingFormat: "zai", contextWindow: 200000, maxOutput: 64000 } },
+	// ── DeepSeek ──
+	{ pattern: "*deepseek-v4*", caps: { reasoning: true, thinkingFormat: "deepseek", contextWindow: 1000000, maxOutput: 384000 } },
+	{ pattern: "*deepseek*", caps: { reasoning: true, thinkingFormat: "deepseek", contextWindow: 128000, maxOutput: 64000 } },
+	// ── MiniMax ──
+	{ pattern: "*minimax-m3*", caps: { vision: true, reasoning: true, thinkingFormat: "minimax", contextWindow: 1048576, maxOutput: 512000 } },
+	{ pattern: "*minimax-m2.7*", caps: { reasoning: true, thinkingFormat: "minimax", thinkingCanDisable: false, contextWindow: 204800, maxOutput: 131072 } },
+	{ pattern: "*minimax*", caps: { reasoning: true, thinkingFormat: "minimax", thinkingCanDisable: false, contextWindow: 200000, maxOutput: 131072 } },
+	// ── Others ──
+	{ pattern: "*hunyuan*", caps: { reasoning: true, thinkingFormat: "hunyuan", contextWindow: 262144, maxOutput: 262144 } },
+	{ pattern: "*llama-4*", caps: { vision: true, contextWindow: 1000000, maxOutput: 64000 } },
+	{ pattern: "*llama*", caps: { contextWindow: 128000, maxOutput: 64000 } },
+	{ pattern: "*codestral*", caps: { contextWindow: 256000, maxOutput: 64000 } },
+	{ pattern: "*mistral-large*", caps: { vision: true, contextWindow: 256000, maxOutput: 64000 } },
+	{ pattern: "*mistral*", caps: { contextWindow: 128000, maxOutput: 64000 } },
+	{ pattern: "*laguna*", caps: { reasoning: true, thinkingFormat: "openai", contextWindow: 200000, maxOutput: 32000 } },
+	{ pattern: "*nemotron*", caps: { reasoning: true, contextWindow: 128000, maxOutput: 64000 } },
+];
+
+/** Glob match (* = wildcard), case-insensitive — same semantics as 9Router's matchPattern. */
+function globMatch(pattern: string, s: string): boolean {
+	const re = new RegExp(
+		"^" + pattern.split("*").map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$",
+		"i",
+	);
+	return re.test(s);
+}
+
+/**
+ * Fill capability gaps (contextWindow, maxOutput, reasoning, vision,
+ * thinkingFormat) from MODEL_PATTERN_CAPS. Matches the leaf model id first
+ * (same as the server's getCapabilitiesForModel baseModel), then the full id.
+ * Explicit server fields are never overwritten.
+ */
+function fillModelCaps(id: string, caps: ModelCapabilities): ModelCapabilities {
+	const leaf = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
+	const row = MODEL_PATTERN_CAPS.find(
+		(r) => globMatch(r.pattern, leaf) || globMatch(r.pattern, id),
+	);
+	if (!row) return caps;
+	const out = { ...caps };
+	if (typeof out.contextWindow !== "number" || out.contextWindow <= 0)
+		out.contextWindow = row.caps.contextWindow;
+	if (typeof out.maxOutput !== "number" || out.maxOutput <= 0)
+		out.maxOutput = row.caps.maxOutput;
+	if (out.vision === undefined) out.vision = row.caps.vision;
+	if (out.reasoning === undefined) out.reasoning = row.caps.reasoning;
+	if (out.thinkingFormat === undefined && out.reasoning === true)
+		out.thinkingFormat = row.caps.thinkingFormat;
+	return out;
+}
+
 function mapThinkingCompat(caps?: ModelCapabilities): {
 	compat?: Record<string, unknown>;
 	thinkingLevelMap?: PiModelDef["thinkingLevelMap"];
@@ -304,9 +412,13 @@ function mapThinkingCompat(caps?: ModelCapabilities): {
 }
 
 function toPiModel(m: RemoteModel, info?: RemoteModel): PiModelDef {
-	const caps = asCaps(info?.capabilities) || asCaps(m.capabilities) || {};
+	// List-row caps win over info-record caps (chat info records are often thin).
+	const caps = fillModelCaps(m.id, {
+		...(asCaps(info?.capabilities) || {}),
+		...(asCaps(m.capabilities) || {}),
+	});
 	const id = m.id;
-	const reasoning = looksReasoning(id, caps);
+	const reasoning = caps.reasoning ?? looksReasoning(id, caps);
 	const vision = caps.vision === true;
 	const contextWindow =
 		(typeof caps.contextWindow === "number" && caps.contextWindow > 0
@@ -437,7 +549,7 @@ async function enrichCatalog(
 				entry.namedByServer = true;
 				named++;
 			}
-			const caps = asCaps(remote.capabilities);
+			const caps = fillModelCaps(entry.id, asCaps(remote.capabilities) || {});
 			if (caps) {
 				entry.capabilities = slimCaps({
 					...(asCaps(entry.capabilities as ModelCapabilities) || {}),
@@ -487,7 +599,7 @@ async function enrichCatalog(
 		if (info.kind?.trim()) entry.detailKind = info.kind.trim();
 		if (info.endpoint?.trim()) entry.endpoint = info.endpoint.trim();
 		if (Array.isArray(info.params) && info.params.length) entry.params = info.params;
-		const caps = asCaps(info.capabilities);
+		const caps = fillModelCaps(entry.id, asCaps(info.capabilities) || {});
 		if (caps) {
 			entry.capabilities = slimCaps({
 				...(asCaps(entry.capabilities as ModelCapabilities) || {}),
@@ -687,7 +799,7 @@ export async function fetchAllAndBuild(
 			if (remotesByKey.has(key)) continue;
 			remotesByKey.set(key, m);
 
-			const caps = asCaps(m.capabilities);
+			const caps = fillModelCaps(m.id, asCaps(m.capabilities) || {});
 			const namedByServer = Boolean(m.name?.trim());
 			catalog.push({
 				id: m.id,
@@ -696,13 +808,13 @@ export async function fetchAllAndBuild(
 				detailKind: m.kind?.trim() || undefined,
 				ownedBy: m.owned_by,
 				endpoint: m.endpoint,
-				capabilities: slimCaps(caps || m.capabilities),
+				capabilities: slimCaps(caps),
 				params: m.params,
 				namedByServer,
-				contextWindow: caps?.contextWindow,
-				maxTokens: caps?.maxOutput,
-				reasoning: looksReasoning(m.id, caps),
-				input: caps?.vision ? ["text", "image"] : ["text"],
+				contextWindow: caps.contextWindow,
+				maxTokens: caps.maxOutput,
+				reasoning: caps.reasoning ?? looksReasoning(m.id, caps),
+				input: caps.vision ? ["text", "image"] : ["text"],
 			});
 		}
 	}
