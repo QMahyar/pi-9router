@@ -148,7 +148,7 @@ interface PiModelDef {
 	maxTokens: number;
 	compat?: Record<string, unknown>;
 	thinkingLevelMap?: Partial<
-		Record<"off" | "minimal" | "low" | "medium" | "high" | "xhigh", string | null>
+		Record<"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max", string | null>
 	>;
 }
 
@@ -322,6 +322,36 @@ function fillModelCaps(id: string, caps: ModelCapabilities): ModelCapabilities {
 	return out;
 }
 
+function thinkingMapFor(
+	caps: ModelCapabilities,
+	format: string,
+): PiModelDef["thinkingLevelMap"] {
+	// pi hides xhigh/max unless the map lists them. Values must match what the
+	// 9router gateway (server) accepts per thinkingFormat — deepseek clamps
+	// low/medium/high to "high" and xhigh/max to "max" (reasoning_effort).
+	const off = caps.thinkingCanDisable === false ? null : "none";
+	if (format.includes("deepseek")) {
+		return {
+			off,
+			minimal: "high",
+			low: "high",
+			medium: "high",
+			high: "high",
+			xhigh: "max",
+			max: "max",
+		};
+	}
+	return {
+		off,
+		minimal: "minimal",
+		low: "low",
+		medium: "medium",
+		high: "high",
+		xhigh: "xhigh",
+		max: "max",
+	};
+}
+
 function mapThinkingCompat(caps?: ModelCapabilities): {
 	compat?: Record<string, unknown>;
 	thinkingLevelMap?: PiModelDef["thinkingLevelMap"];
@@ -345,6 +375,7 @@ function mapThinkingCompat(caps?: ModelCapabilities): {
 				thinkingFormat: format === "openrouter" ? "openrouter" : "openai",
 				maxTokensField: "max_tokens",
 			},
+			thinkingLevelMap: thinkingMapFor(caps, format),
 		};
 	}
 
@@ -356,6 +387,7 @@ function mapThinkingCompat(caps?: ModelCapabilities): {
 				thinkingFormat: "openrouter",
 				maxTokensField: "max_tokens",
 			},
+			thinkingLevelMap: thinkingMapFor(caps, format),
 		};
 	}
 
@@ -366,6 +398,7 @@ function mapThinkingCompat(caps?: ModelCapabilities): {
 				supportsReasoningEffort: true,
 				maxTokensField: "max_tokens",
 			},
+			thinkingLevelMap: thinkingMapFor(caps, format),
 		};
 	}
 
@@ -384,10 +417,10 @@ function mapThinkingCompat(caps?: ModelCapabilities): {
 		return {
 			compat: {
 				supportsDeveloperRole: false,
-				supportsReasoningEffort: false,
-				thinkingFormat: "deepseek",
+				supportsReasoningEffort: true,
 				maxTokensField: "max_tokens",
 			},
+			thinkingLevelMap: thinkingMapFor(caps, format),
 		};
 	}
 
@@ -408,6 +441,7 @@ function mapThinkingCompat(caps?: ModelCapabilities): {
 			supportsReasoningEffort: true,
 			maxTokensField: "max_tokens",
 		},
+		thinkingLevelMap: thinkingMapFor(caps, format),
 	};
 }
 
