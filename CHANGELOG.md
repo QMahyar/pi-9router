@@ -31,7 +31,7 @@ Do **not** put machine-only paths or secrets here — those stay in gitignored `
 
 ### Notes
 
-- Nothing in flight — 1.2.6 shipped the review-driven fixes + typecheck/tests/CI.
+- **git is ahead of npm**: 1.2.6 committed + pushed (`c578aac`) but `npm publish` needs an OTP. Retry later with `npm publish --access public --otp=<code>` — do **not** re-bump the version. Verify with `npm view @qmahyar/pi-9router version`.
 
 ---
 
