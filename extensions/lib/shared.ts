@@ -3,9 +3,11 @@
  * Not an extension entry point (no default export) — only imported.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import { randomBytes } from "node:crypto";
+import type { Theme } from "@earendil-works/pi-coding-agent";
 
 // ── Paths / defaults ────────────────────────────────────────────
 
@@ -60,30 +62,133 @@ export interface RemoteModel {
 	created?: number;
 }
 
+/** Shared slim catalog entry — written by 9router.ts, read by 9router-tools.ts. */
+export interface CatalogEntry {
+	id: string;
+	name: string;
+	kind: string;
+	detailKind?: string;
+	ownedBy?: string;
+	endpoint?: string;
+	/** Slim caps for tools/browse — not the full server blob */
+	capabilities?: ModelCapabilities | string[];
+	params?: string[];
+	namedByServer?: boolean;
+	synthetic?: boolean;
+	note?: string;
+	registered?: boolean;
+	contextWindow?: number;
+	maxTokens?: number;
+	reasoning?: boolean;
+	input?: Array<"text" | "image">;
+}
+
+/**
+ * Voice-based TTS providers. Probed during full sync: the two entries with
+ * voices/probe metadata in VOICE_TTS_PROVIDERS (9router.ts). Tools accept any
+ * of these prefixes as a pass-through TTS model id (`<prefix>/<voice>`).
+ */
+export const VOICE_PROVIDER_PREFIXES: readonly string[] = ["edge-tts", "google-tts", "el", "local-device"];
+
+// ── Capability tools (single source for both extensions) ────────
+
+export type CapId = "image" | "tts" | "embed" | "web_search" | "web_fetch";
+
+export interface CapDef {
+	id: CapId;
+	tool: string;
+	label: string;
+	catalogKind: string | ((e: CatalogEntry) => boolean);
+	defaultEnabled: boolean;
+	blurb: string;
+}
+
+export const CAPS: CapDef[] = [
+	{
+		id: "image",
+		tool: "nr_image_generate",
+		label: "Image generation",
+		catalogKind: "image",
+		defaultEnabled: true,
+		blurb: "Text → image",
+	},
+	{
+		id: "tts",
+		tool: "nr_tts",
+		label: "Text to speech",
+		catalogKind: "tts",
+		defaultEnabled: true,
+		blurb: "Text → audio file",
+	},
+	{
+		id: "embed",
+		tool: "nr_embed",
+		label: "Embeddings",
+		catalogKind: "embedding",
+		defaultEnabled: false,
+		blurb: "Text → vectors",
+	},
+	{
+		id: "web_search",
+		tool: "nr_web_search",
+		label: "Web search",
+		catalogKind: (e) =>
+			e.kind === "web" && (e.detailKind === "webSearch" || (!e.detailKind && /search/i.test(e.id))),
+		defaultEnabled: true,
+		blurb: "Query → results",
+	},
+	{
+		id: "web_fetch",
+		tool: "nr_web_fetch",
+		label: "Web fetch",
+		catalogKind: (e) =>
+			e.kind === "web" && (e.detailKind === "webFetch" || (!e.detailKind && /fetch/i.test(e.id))),
+		defaultEnabled: true,
+		blurb: "URL → markdown",
+	},
+];
+
 // ── Config I/O ──────────────────────────────────────────────────
 
-export function loadJsonFile(): Record<string, unknown> {
-	if (!existsSync(CONFIG_PATH)) return {};
+export function loadJsonFile(path: string = CONFIG_PATH): Record<string, unknown> {
+	if (!existsSync(path)) return {};
 	try {
-		return JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as Record<string, unknown>;
+		return JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
 	} catch {
 		return {};
 	}
 }
 
-/** Deep-merge top-level keys; merges `capabilities` one level when both sides set it. */
-export function saveJsonMerge(patch: Record<string, unknown>): Record<string, unknown> {
-	const dir = dirname(CONFIG_PATH);
+/**
+ * Write JSON atomically (temp file + rename) so a crash or a concurrent
+ * write from the other 9router extension can never truncate the config.
+ */
+function writeJsonAtomic(path: string, data: unknown): void {
+	const dir = dirname(path);
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-	const cur = loadJsonFile();
-	const next: Record<string, unknown> = { ...cur, ...patch };
-	if (patch.capabilities && typeof patch.capabilities === "object") {
-		next.capabilities = {
-			...((cur.capabilities as Record<string, unknown>) || {}),
-			...(patch.capabilities as Record<string, unknown>),
-		};
+	const tmp = join(dir, `.${basenameOf(path)}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`);
+	writeFileSync(tmp, JSON.stringify(data, null, 2));
+	try {
+		chmodSync(tmp, 0o600); // config can hold an API key (no-op-ish on Windows)
+	} catch {
+		/* platform without chmod semantics */
 	}
-	// Drop legacy keys from older installs
+	renameSync(tmp, path);
+}
+
+function basenameOf(path: string): string {
+	const i = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+	return i >= 0 ? path.slice(i + 1) : path;
+}
+
+/** Legacy keys dropped from older installs; their presence triggers a rewrite. */
+export function hasLegacyKeys(raw: Record<string, unknown> = loadJsonFile()): boolean {
+	if ("voice" in raw || "ffmpegPath" in raw) return true;
+	const caps = raw.capabilities as Record<string, unknown> | undefined;
+	return Boolean(caps && "stt" in caps);
+}
+
+function stripLegacyKeys(next: Record<string, unknown>): Record<string, unknown> {
 	delete next.voice;
 	delete next.ffmpegPath;
 	if (next.capabilities && typeof next.capabilities === "object") {
@@ -91,7 +196,24 @@ export function saveJsonMerge(patch: Record<string, unknown>): Record<string, un
 		delete caps.stt;
 		next.capabilities = caps;
 	}
-	writeFileSync(CONFIG_PATH, JSON.stringify(next, null, 2));
+	return next;
+}
+
+/** Deep-merge top-level keys; merges `capabilities` one level when both sides set it. */
+export function saveJsonMerge(
+	patch: Record<string, unknown>,
+	path: string = CONFIG_PATH,
+): Record<string, unknown> {
+	const cur = loadJsonFile(path);
+	const next: Record<string, unknown> = { ...cur, ...patch };
+	if (patch.capabilities && typeof patch.capabilities === "object") {
+		next.capabilities = {
+			...((cur.capabilities as Record<string, unknown>) || {}),
+			...(patch.capabilities as Record<string, unknown>),
+		};
+	}
+	stripLegacyKeys(next);
+	writeJsonAtomic(path, next);
 	return next;
 }
 
@@ -126,14 +248,10 @@ export function isSyncStale(lastSync?: string, maxAgeMs = STALE_SYNC_MS): boolea
 
 // ── Footer status (single slot for both extensions) ─────────────
 
-/** Default on/off for capability tools — keep in sync with CAPS in 9router-tools. */
-export const TOOL_CAP_DEFAULTS: Record<string, boolean> = {
-	image: true,
-	tts: true,
-	embed: false,
-	web_search: true,
-	web_fetch: true,
-};
+/** Default on/off for capability tools — derived from CAPS, no manual sync. */
+export const TOOL_CAP_DEFAULTS: Record<string, boolean> = Object.fromEntries(
+	CAPS.map((c) => [c.id, c.defaultEnabled]),
+);
 
 /** One footer key so we never show two competing "9router" / "tools" lines. */
 export const FOOTER_STATUS_ID = "9router";
@@ -217,7 +335,7 @@ export function formatFooterText(snap: FooterSnapshot): { text: string; tone: "d
 
 type StatusUi = {
 	setStatus: (id: string, text: string | undefined) => void;
-	theme: { fg: (name: string, text: string) => string };
+	theme: Pick<Theme, "fg">;
 };
 
 /**
@@ -249,8 +367,15 @@ export function withTimeout(timeoutMs: number, parent?: AbortSignal): AbortSigna
 		if (parent.aborted) onParent();
 		else parent.addEventListener("abort", onParent, { once: true });
 	}
-	// Clear timer when our signal aborts for any reason so we don't leak
-	ctrl.signal.addEventListener("abort", () => clearTimeout(timer), { once: true });
+	// Clear timer and detach the parent listener when we abort for any reason
+	ctrl.signal.addEventListener(
+		"abort",
+		() => {
+			clearTimeout(timer);
+			parent?.removeEventListener("abort", onParent);
+		},
+		{ once: true },
+	);
 	return ctrl.signal;
 }
 
@@ -471,4 +596,9 @@ export function inferNameFromId(id: string): string {
 	return leaf
 		.replace(/[-_]/g, " ")
 		.replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+/** Sanitize a model-supplied output file name: no separators, no traversal. */
+export function safeFilename(name: string): string {
+	return name.replace(/[^\w.\-]+/g, "_");
 }

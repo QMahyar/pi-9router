@@ -5,7 +5,8 @@ extensions/
   9router.ts         # /9router — sync + chat provider + diagnose
   9router-tools.ts   # /9router-tools + nr_* tools
   lib/
-    shared.ts        # HTTP, timeouts, config merge (not an entry point)
+    shared.ts        # HTTP, timeouts, config merge, CAPS (not an entry point)
+tests/               # offline unit tests (bun test)
 scripts/
   e2e-test.ts        # live E2E against local 9Router
 CHANGELOG.md         # cross-session WIP + release history (update every session)
@@ -34,18 +35,24 @@ previous non-chat catalog entries so tools keep working.
 after a `/v1/audio/speech` probe returns real audio.
 
 **Tool descriptions** stay compact (configured default model + count, not the
-full catalog); `registerAll()` re-runs on `9router:synced`. Tool failures
+full catalog); `registerAllTools()` re-runs on `9router:synced` and after a
+default-model change in `/9router-tools`. Tool failures
 **throw** from `execute()` (a returned `isError: true` is ignored by pi — only
 throwing sets the error flag). `nr_web_search`/`nr_web_fetch` results are
 truncated to 50KB/2000 lines with the full text saved to a temp file. The chat
-provider also exposes a live `refreshModels` hook (falls back to cached models on
-error), so pi-side refresh flows like `pi update --models` re-fetch the chat list
-without a manual /9router sync.
+provider also exposes a live `refreshModels` hook (persists successful
+refreshes; falls back to cached models on error), so pi-side refresh flows like
+`pi update --models` re-fetch the chat list without a manual /9router sync.
 
 **Images.** `nr_image_generate` loops `n` times on the binary path, supports optional
-`image_path` for edit/img2img, and returns a path by default (`attachImages` opts in).
+`image_path` for edit/img2img (20 MB cap), and returns a path by default
+(`attachImages` opts in). 200-with-JSON responses are never saved as image
+files, and 401/402/403 aborts the fallback chain instead of retrying paid
+requests. Existing output files are never overwritten (numeric suffix on
+collision).
 
-**TTS.** Binary audio first; JSON `?response_format=json` only as fallback.
+**TTS.** Binary audio first; a JSON body on the binary path is parsed in place
+(`{audio, format}`), with `?response_format=json` only as a re-request fallback.
 
 **`model` on the wire** is not always the catalog id: search/fetch take a bare
 provider name (`exa`, not `exa/search`).
@@ -55,16 +62,27 @@ provider name (`exa`, not `exa/search`).
 **Stale catalog:** lastSync older than 24h shows a warning in status / session footer.
 
 Exported for testing: `fetchAllAndBuild`, `diagnoseConnection`, `resolveModel`,
-`describeModels`, `CAPS`, `generateImages`.
+`describeModels`, `CAPS`, `generateImages`, plus pure helpers from
+`lib/shared.ts` and `globMatch`/`fillModelCaps`/`mapThinkingCompat` from
+`9router.ts`.
 
 ```bash
-# typecheck / bundle
+# typecheck (strict, no emit)
+bun run typecheck
+
+# offline unit tests
+bun test
+
+# optional bundle smoke check
 bun build extensions/9router.ts extensions/9router-tools.ts \
   --target=node --external '*' --outdir "$LOCALAPPDATA/Temp/nrbuild"
 
 # live E2E (9Router must be running)
-bun run scripts/e2e-test.ts
+bun run e2e
 ```
+
+CI (`.github/workflows/ci.yml`) runs install + typecheck + unit tests on every
+push/PR; the live E2E stays local by design.
 
 **Local install (this machine):** copy loose files — do not `pi install` alongside them:
 

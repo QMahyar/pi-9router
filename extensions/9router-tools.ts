@@ -38,11 +38,17 @@ import { basename, extname, isAbsolute, join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import {
+	CAPS,
 	CONFIG_PATH,
+	type CapDef,
+	type CapId,
+	type CatalogEntry,
 	DEFAULT_OUTPUT_DIR,
 	TIMEOUT,
+	VOICE_PROVIDER_PREFIXES,
 	downloadUrl,
 	footerFromConfig,
+	hasLegacyKeys,
 	isSyncStale,
 	loadJsonFile,
 	normalizeEndpoint,
@@ -50,27 +56,11 @@ import {
 	postBinary,
 	postJson,
 	resolveApiKey,
+	safeFilename,
 	saveJsonMerge,
 } from "./lib/shared.ts";
 
 // ── Types ───────────────────────────────────────────────────────
-
-type CapId = "image" | "tts" | "embed" | "web_search" | "web_fetch";
-
-interface CatalogEntry {
-	id: string;
-	name?: string;
-	kind: string;
-	detailKind?: string;
-	ownedBy?: string;
-	capabilities?: unknown;
-	params?: string[];
-	namedByServer?: boolean;
-	synthetic?: boolean;
-	note?: string;
-}
-
-const VOICE_PROVIDER_PREFIXES = ["edge-tts", "google-tts", "el", "local-device"];
 
 interface CapState {
 	enabled: boolean;
@@ -89,60 +79,6 @@ interface ToolsConfigSlice {
 	/** Inline generated images into the conversation as base64 (default false) */
 	attachImages?: boolean;
 }
-
-interface CapDef {
-	id: CapId;
-	tool: string;
-	label: string;
-	catalogKind: string | ((e: CatalogEntry) => boolean);
-	defaultEnabled: boolean;
-	blurb: string;
-}
-
-export const CAPS: CapDef[] = [
-	{
-		id: "image",
-		tool: "nr_image_generate",
-		label: "Image generation",
-		catalogKind: "image",
-		defaultEnabled: true,
-		blurb: "Text → image",
-	},
-	{
-		id: "tts",
-		tool: "nr_tts",
-		label: "Text to speech",
-		catalogKind: "tts",
-		defaultEnabled: true,
-		blurb: "Text → audio file",
-	},
-	{
-		id: "embed",
-		tool: "nr_embed",
-		label: "Embeddings",
-		catalogKind: "embedding",
-		defaultEnabled: false,
-		blurb: "Text → vectors",
-	},
-	{
-		id: "web_search",
-		tool: "nr_web_search",
-		label: "Web search",
-		catalogKind: (e) =>
-			e.kind === "web" && (e.detailKind === "webSearch" || (!e.detailKind && /search/i.test(e.id))),
-		defaultEnabled: true,
-		blurb: "Query → results",
-	},
-	{
-		id: "web_fetch",
-		tool: "nr_web_fetch",
-		label: "Web fetch",
-		catalogKind: (e) =>
-			e.kind === "web" && (e.detailKind === "webFetch" || (!e.detailKind && /fetch/i.test(e.id))),
-		defaultEnabled: true,
-		blurb: "URL → markdown",
-	},
-];
 
 // ── Config ──────────────────────────────────────────────────────
 
@@ -376,11 +312,22 @@ function stamp(): string {
 	return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 }
 
+/** Write bytes without ever clobbering an existing file (numeric suffix on collision). */
 async function writeBytes(dir: string, name: string, bytes: Uint8Array): Promise<string> {
 	await ensureDir(dir);
-	const path = join(dir, name);
-	await writeFile(path, bytes);
-	return path;
+	const ext = extname(name);
+	const stem = ext ? name.slice(0, -ext.length) : name;
+	for (let attempt = 0; ; attempt++) {
+		const candidate = attempt === 0 ? name : `${stem}-${attempt}${ext}`;
+		try {
+			const path = join(dir, candidate);
+			await writeFile(path, bytes, { flag: "wx" });
+			return path;
+		} catch (err: any) {
+			if (err?.code === "EEXIST") continue;
+			throw err;
+		}
+	}
 }
 
 function extFromContentType(ct: string, fallback: string): string {
@@ -417,6 +364,9 @@ function decodeDataUrlOrB64(raw: string): { bytes: Uint8Array; ext: string } | n
 	}
 }
 
+/** Max size for a reference image — caps memory and upstream payload. */
+const MAX_IMAGE_REF_BYTES = 20 * 1024 * 1024;
+
 /**
  * Resolve a local image path for edit/reference; return base64 data URL or null.
  * Strips a leading "@" (some models paste @ into path args) before resolving.
@@ -430,7 +380,7 @@ async function loadImageRef(pathOrData: string, cwd: string): Promise<string | n
 		const cleaned = raw.replace(/\s/g, "");
 		try {
 			const buf = Buffer.from(cleaned, "base64");
-			if (buf.length > 32) {
+			if (buf.length > 32 && buf.length <= MAX_IMAGE_REF_BYTES) {
 				const ext =
 					buf[0] === 0xff && buf[1] === 0xd8
 						? "jpeg"
@@ -446,6 +396,8 @@ async function loadImageRef(pathOrData: string, cwd: string): Promise<string | n
 	const target = raw.startsWith("@") ? raw.slice(1) : raw;
 	const abs = isAbsolute(target) ? target : resolve(cwd, target);
 	try {
+		const st = await stat(abs);
+		if (st.size > MAX_IMAGE_REF_BYTES) return null;
 		const bytes = await readFile(abs);
 		const ext = extname(abs).toLowerCase();
 		const media =
@@ -599,6 +551,9 @@ async function configureCap(
 					[cap.id]: { ...getCapState(cfg, cap), model: model || undefined },
 				},
 			});
+			// Descriptions bake in the default model — re-register so they stay true.
+			registerAllTools(pi, cfg);
+			applyToolActivation(pi, cfg);
 			ui.notify(model ? `Default: ${model}` : "Default cleared (use first available)", "info");
 			continue;
 		}
@@ -723,7 +678,7 @@ function textFromResult(result: { content?: Array<{ type: string; text?: string 
 // ── Output truncation (docs-mandated: default 50KB / 2000 lines) ────────────
 
 async function writeTempArtifact(text: string, prefix: string): Promise<string> {
-	const name = `${prefix}-${stamp()}-${randomBytes(3).toString("hex")}.txt`;
+	const name = `${prefix}-${stamp()}-${randomBytes(8).toString("hex")}.txt`;
 	const path = join(tmpdir(), name);
 	await writeFile(path, text, "utf8");
 	return path;
@@ -746,6 +701,14 @@ async function truncateResult(
 
 // ── Image generation (n + optional edit ref) ────────────────────
 
+/** Definitive failures — retrying with another response_format cannot help. */
+const FATAL_STATUSES = [401, 402, 403];
+
+/** True when a 200 body is actually JSON (error or b64/url payload), not raw bytes. */
+function bodyIsJson(contentType: string, bytes: Uint8Array): boolean {
+	return contentType.toLowerCase().includes("json") || bytes[0] === 0x7b /* { */;
+}
+
 async function generateImages(opts: {
 	ep: string;
 	key: string;
@@ -767,11 +730,7 @@ async function generateImages(opts: {
 	const baseBody: Record<string, unknown> = { model, prompt, n: 1 };
 	if (size) baseBody.size = size;
 	if (quality) baseBody.quality = quality;
-	if (imageDataUrl) {
-		// Providers accept `image` (single) and/or `images[]`
-		baseBody.image = imageDataUrl;
-		baseBody.images = [imageDataUrl];
-	}
+	if (imageDataUrl) baseBody.image = imageDataUrl;
 
 	for (let i = 0; i < count; i++) {
 		// Prefer binary (raw bytes) — matches skill default for saving files
@@ -781,12 +740,14 @@ async function generateImages(opts: {
 			baseBody,
 			{ signal, timeoutMs: TIMEOUT.tool },
 		);
-		if (bin.ok && bin.bytes.length > 100) {
+		if (!bin.ok && FATAL_STATUSES.includes(bin.status)) {
+			return { saved, error: `Image generation failed (${bin.status}): ${bin.error}` };
+		}
+		if (bin.ok && bin.bytes.length > 100 && !bodyIsJson(bin.contentType, bin.bytes)) {
 			const ext = extFromContentType(bin.contentType, ".png");
+			const cleanName = filename ? safeFilename(filename) : "";
 			const name =
-				(filename?.replace(/[^\w.\-]+/g, "_") && count === 1
-					? withExt(filename.replace(/[^\w.\-]+/g, "_"), ext)
-					: null) ||
+				(cleanName && count === 1 ? withExt(cleanName, ext) : null) ||
 				`img-${stamp()}-${slug(prompt)}-${i}-${randomBytes(2).toString("hex")}${ext}`;
 			saved.push(await writeBytes(outDir, name, bin.bytes));
 			continue;
@@ -799,8 +760,11 @@ async function generateImages(opts: {
 			{ ...baseBody, response_format: "b64_json" },
 			{ signal, timeoutMs: TIMEOUT.tool },
 		);
+		if (!res.ok && FATAL_STATUSES.includes(res.status)) {
+			return { saved, error: `Image generation failed (${res.status}): ${res.error}` };
+		}
 		if (res.ok) {
-			const rows = res.data?.data || [];
+			const rows = Array.isArray(res.data?.data) ? res.data.data : [];
 			if (!rows.length && i === 0) {
 				// try url format once
 				const res2 = await postJson(
@@ -821,10 +785,7 @@ async function generateImages(opts: {
 					const dl = await downloadUrl(url, { signal });
 					if (!dl) continue;
 					const ext = extFromContentType(dl.contentType, ".png");
-					const nm =
-						filename?.replace(/[^\w.\-]+/g, "_") && (res2.data.data || []).length === 1
-							? withExt(filename.replace(/[^\w.\-]+/g, "_"), ext)
-							: `img-${stamp()}-${slug(prompt)}-${j}-${randomBytes(2).toString("hex")}${ext}`;
+					const nm = `img-${stamp()}-${slug(prompt)}-${j}-${randomBytes(2).toString("hex")}${ext}`;
 					saved.push(await writeBytes(outDir, nm, dl.bytes));
 				}
 				// url response may already include n images — done
@@ -836,8 +797,8 @@ async function generateImages(opts: {
 				const dec = decodeDataUrlOrB64(b64);
 				if (!dec) continue;
 				const nm =
-					filename?.replace(/[^\w.\-]+/g, "_") && rows.length === 1 && count === 1
-						? withExt(filename.replace(/[^\w.\-]+/g, "_"), dec.ext)
+					filename && rows.length === 1 && count === 1
+						? withExt(safeFilename(filename), dec.ext)
 						: `img-${stamp()}-${slug(prompt)}-${i}-${j}-${randomBytes(2).toString("hex")}${dec.ext}`;
 				saved.push(await writeBytes(outDir, nm, dec.bytes));
 			}
@@ -911,16 +872,16 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			),
 		}),
 		prepareArguments(args) {
-			if (!args || typeof args !== "object") return args;
+			if (!args || typeof args !== "object") return args as never;
 			const input = args as Record<string, unknown>;
 			// Resumed/legacy sessions may pass camelCase — fold into the schema.
 			if (input.image_path === undefined && typeof input.imagePath === "string") {
 				const rest: Record<string, unknown> = { ...input };
 				delete rest.imagePath;
 				rest.image_path = input.imagePath;
-				return rest;
+				return rest as never;
 			}
-			return args;
+			return args as never;
 		},
 		async execute(_id, params, signal, onUpdate, ctx) {
 			const cfg = loadRaw();
@@ -953,6 +914,7 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 						text: `Generating ${n} image(s) with ${model}${imageDataUrl ? " (edit/ref)" : ""}…`,
 					},
 				],
+				details: {},
 			});
 
 			const { saved, error } = await generateImages({
@@ -985,7 +947,7 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 
 			const content: Array<
 				| { type: "text"; text: string }
-				| { type: "image"; source: { type: "base64"; mediaType: string; data: string } }
+				| { type: "image"; data: string; mimeType: string }
 			> = [{ type: "text", text }];
 
 			let attached = false;
@@ -1000,7 +962,8 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 							ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" : ext === ".webp" ? "image/webp" : "image/png";
 						content.push({
 							type: "image",
-							source: { type: "base64", mediaType, data: bytes.toString("base64") },
+							data: bytes.toString("base64"),
+							mimeType: mediaType,
 						});
 						attached = true;
 					}
@@ -1063,7 +1026,7 @@ function registerTtsTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			const picked = resolveModel(cfg, cap, params.model);
 			if (!picked.ok) return toolError(picked.message, { requested: params.model });
 			const model = picked.id;
-			onUpdate?.({ content: [{ type: "text", text: `Synthesizing · ${model}` }] });
+			onUpdate?.({ content: [{ type: "text", text: `Synthesizing · ${model}` }], details: {} });
 
 			const ep = endpointOf(cfg);
 			const key = apiKeyOf(cfg);
@@ -1077,10 +1040,28 @@ function registerTtsTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 				timeoutMs: TIMEOUT.tool,
 			});
 			if (bin.ok && bin.bytes.length > 64) {
-				// Reject tiny JSON error bodies disguised as 200
-				const ct = bin.contentType.toLowerCase();
-				if (ct.includes("json") || bin.bytes[0] === 0x7b /* { */) {
-					// fall through to json path
+				if (bodyIsJson(bin.contentType, bin.bytes)) {
+					// 200 with a JSON body: {audio, format} payload or an error —
+					// parse it instead of paying for a second synthesis request.
+					try {
+						const parsed = JSON.parse(Buffer.from(bin.bytes).toString("utf8")) as {
+							audio?: string;
+							format?: string;
+							error?: unknown;
+						};
+						if (parsed.audio) {
+							bytes = Buffer.from(parsed.audio, "base64");
+							if (parsed.format) ext = `.${String(parsed.format).replace(/^\./, "")}`;
+						} else if (parsed.error) {
+							const msg =
+								typeof parsed.error === "object" && parsed.error !== null && "message" in parsed.error
+									? String((parsed.error as { message: unknown }).message)
+									: String(parsed.error);
+							return toolError(`TTS failed (200 JSON body): ${msg}`, { model });
+						}
+					} catch {
+						/* fall through to the json request below */
+					}
 				} else {
 					bytes = bin.bytes;
 					ext = extFromContentType(bin.contentType, ".mp3");
@@ -1109,8 +1090,7 @@ function registerTtsTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 
 			if (!bytes?.length) return toolError("Empty audio.", { model });
 			const name =
-				(params.filename?.replace(/[^\w.\-]+/g, "_") &&
-					withExt(params.filename.replace(/[^\w.\-]+/g, "_"), ext)) ||
+				(params.filename && withExt(safeFilename(params.filename), ext)) ||
 				`tts-${stamp()}-${slug(params.input)}${ext}`;
 			const path = await writeBytes(outDir, name, bytes);
 			return toolOk(
@@ -1168,7 +1148,7 @@ function registerEmbedTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 						.map((s) => s.trim())
 						.filter(Boolean)
 				: [params.input];
-			onUpdate?.({ content: [{ type: "text", text: `Embedding ${parts.length} input(s)…` }] });
+			onUpdate?.({ content: [{ type: "text", text: `Embedding ${parts.length} input(s)…` }], details: {} });
 			const body: Record<string, unknown> = { model, input: parts.length === 1 ? parts[0] : parts };
 			if (params.dimensions) body.dimensions = params.dimensions;
 			const res = await postJson(`${endpointOf(cfg)}/v1/embeddings`, apiKeyOf(cfg), body, {
@@ -1176,7 +1156,10 @@ function registerEmbedTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 				timeoutMs: TIMEOUT.tool,
 			});
 			if (!res.ok) return toolError(`Embeddings failed (${res.status}): ${res.error}`, { model });
-			const data = res.data?.data || [];
+			const data = Array.isArray(res.data?.data) ? res.data.data : [];
+			if (!data.length) {
+				return toolError(`Embeddings returned no vectors.`, { model, inputs: parts.length });
+			}
 			const lines = [`Model: ${model}`, `Inputs: ${parts.length}`, `Vectors: ${data.length}`];
 			for (const row of data) {
 				const vec: number[] = row.embedding || [];
@@ -1251,7 +1234,7 @@ function registerWebSearchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			const model = picked.id;
 			// Wire: bare provider ("exa"), not catalog id ("exa/search")
 			const apiModel = model.replace(/\/search$/i, "");
-			onUpdate?.({ content: [{ type: "text", text: `Searching · ${apiModel}` }] });
+			onUpdate?.({ content: [{ type: "text", text: `Searching · ${apiModel}` }], details: {} });
 			const body: Record<string, unknown> = {
 				model: apiModel,
 				query: params.query,
@@ -1336,7 +1319,7 @@ function registerWebFetchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			const model = picked.id;
 			const apiModel = model.replace(/\/fetch$/i, "");
 			if (!/^https?:\/\//i.test(params.url)) return toolError("url must be absolute http(s)");
-			onUpdate?.({ content: [{ type: "text", text: `Fetching · ${params.url}` }] });
+			onUpdate?.({ content: [{ type: "text", text: `Fetching · ${params.url}` }], details: {} });
 			const body: Record<string, unknown> = {
 				model: apiModel,
 				url: params.url,
@@ -1381,16 +1364,16 @@ function registerWebFetchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 
 // ── Entry ───────────────────────────────────────────────────────
 
-export default function (pi: ExtensionAPI) {
-	const registerAll = (cfg: ToolsConfigSlice) => {
-		registerImageTool(pi, cfg);
-		registerTtsTool(pi, cfg);
-		registerEmbedTool(pi, cfg);
-		registerWebSearchTool(pi, cfg);
-		registerWebFetchTool(pi, cfg);
-	};
+function registerAllTools(pi: ExtensionAPI, cfg: ToolsConfigSlice): void {
+	registerImageTool(pi, cfg);
+	registerTtsTool(pi, cfg);
+	registerEmbedTool(pi, cfg);
+	registerWebSearchTool(pi, cfg);
+	registerWebFetchTool(pi, cfg);
+}
 
-	registerAll(loadRaw());
+export default function (pi: ExtensionAPI) {
+	registerAllTools(pi, loadRaw());
 
 	const applyFromDisk = () => applyToolActivation(pi, loadRaw());
 
@@ -1399,13 +1382,13 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
-		saveRaw({}); // strip legacy keys
+		if (hasLegacyKeys()) saveRaw({}); // one-time strip for older installs
 		applyFromDisk();
 		if (ctx.hasUI) refreshFooter(ctx.ui);
 	});
 
 	pi.events.on("9router:synced", () => {
-		registerAll(loadRaw());
+		registerAllTools(pi, loadRaw());
 		applyFromDisk();
 	});
 
@@ -1430,3 +1413,5 @@ export default function (pi: ExtensionAPI) {
 
 // Test helpers
 export { generateImages, loadImageRef, modelsForCap, getCapState };
+// Re-exported for scripts/tests (documented export surface)
+export { CAPS } from "./lib/shared.ts";

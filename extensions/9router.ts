@@ -30,6 +30,7 @@ import {
 	DEFAULT_ENDPOINT,
 	TIMEOUT,
 	STALE_SYNC_MS,
+	type CatalogEntry,
 	type ModelCapabilities,
 	type RemoteModel,
 	asCaps,
@@ -73,7 +74,7 @@ const FULL_CATALOG_KINDS = [
 /** Chat-only quick sync — skips tool catalogs and voice probes. */
 const QUICK_CATALOG_KINDS = ["chat"] as const;
 
-type CatalogKind = (typeof FULL_CATALOG_KINDS)[number] | "stt" | string;
+type CatalogKind = string;
 
 const INFO_CONCURRENCY = 8;
 
@@ -118,26 +119,6 @@ const VOICE_TTS_PROVIDERS: Array<{
 
 // ── Types ───────────────────────────────────────────────────────
 
-interface CatalogEntry {
-	id: string;
-	name: string;
-	kind: CatalogKind;
-	detailKind?: string;
-	ownedBy?: string;
-	endpoint?: string;
-	/** Slim caps for tools/browse — not the full server blob */
-	capabilities?: ModelCapabilities | string[];
-	params?: string[];
-	namedByServer?: boolean;
-	synthetic?: boolean;
-	note?: string;
-	registered?: boolean;
-	contextWindow?: number;
-	maxTokens?: number;
-	reasoning?: boolean;
-	input?: Array<"text" | "image">;
-}
-
 interface PiModelDef {
 	id: string;
 	name: string;
@@ -147,9 +128,6 @@ interface PiModelDef {
 	contextWindow: number;
 	maxTokens: number;
 	compat?: Record<string, unknown>;
-	thinkingLevelMap?: Partial<
-		Record<"off" | "minimal" | "low" | "medium" | "high" | "xhigh", string | null>
-	>;
 }
 
 interface Config {
@@ -290,7 +268,7 @@ const MODEL_PATTERN_CAPS: Array<{
 ];
 
 /** Glob match (* = wildcard), case-insensitive — same semantics as 9Router's matchPattern. */
-function globMatch(pattern: string, s: string): boolean {
+export function globMatch(pattern: string, s: string): boolean {
 	const re = new RegExp(
 		"^" + pattern.split("*").map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$",
 		"i",
@@ -304,8 +282,7 @@ function globMatch(pattern: string, s: string): boolean {
  * (same as the server's getCapabilitiesForModel baseModel), then the full id.
  * Explicit server fields are never overwritten.
  */
-function fillModelCaps(id: string, caps: ModelCapabilities): ModelCapabilities {
-	const leaf = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
+export function fillModelCaps(id: string, caps: ModelCapabilities): ModelCapabilities {	const leaf = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
 	const row = MODEL_PATTERN_CAPS.find(
 		(r) => globMatch(r.pattern, leaf) || globMatch(r.pattern, id),
 	);
@@ -322,9 +299,8 @@ function fillModelCaps(id: string, caps: ModelCapabilities): ModelCapabilities {
 	return out;
 }
 
-function mapThinkingCompat(caps?: ModelCapabilities): {
+export function mapThinkingCompat(caps?: ModelCapabilities): {
 	compat?: Record<string, unknown>;
-	thinkingLevelMap?: PiModelDef["thinkingLevelMap"];
 } {
 	const format = (caps?.thinkingFormat || "").toLowerCase();
 	if (!caps?.reasoning && !format) {
@@ -369,7 +345,7 @@ function mapThinkingCompat(caps?: ModelCapabilities): {
 		};
 	}
 
-	if (format === "qwen" || format.includes("qwen")) {
+	if (format.includes("qwen")) {
 		return {
 			compat: {
 				supportsDeveloperRole: false,
@@ -380,7 +356,7 @@ function mapThinkingCompat(caps?: ModelCapabilities): {
 		};
 	}
 
-	if (format === "deepseek" || format.includes("deepseek")) {
+	if (format.includes("deepseek")) {
 		return {
 			compat: {
 				supportsDeveloperRole: false,
@@ -425,13 +401,10 @@ function toPiModel(m: RemoteModel, info?: RemoteModel): PiModelDef {
 			? caps.contextWindow
 			: undefined) || 128000;
 	const maxTokens =
-		(typeof caps.maxOutput === "number" && caps.maxOutput > 0
-			? caps.maxOutput
-			: undefined) ||
-		Math.min(64000, Math.floor(contextWindow / 4)) ||
-		8192;
+		(typeof caps.maxOutput === "number" && caps.maxOutput > 0 ? caps.maxOutput : undefined) ||
+		Math.min(64000, Math.floor(contextWindow / 4));
 
-	const { compat, thinkingLevelMap } = mapThinkingCompat({ ...caps, reasoning });
+	const { compat } = mapThinkingCompat({ ...caps, reasoning });
 
 	const def: PiModelDef = {
 		id,
@@ -443,7 +416,6 @@ function toPiModel(m: RemoteModel, info?: RemoteModel): PiModelDef {
 		maxTokens,
 	};
 	if (compat) def.compat = compat;
-	if (thinkingLevelMap) def.thinkingLevelMap = thinkingLevelMap;
 	return def;
 }
 
@@ -505,6 +477,18 @@ async function fetchModelInfo(
 	return res.data;
 }
 
+/** Merge fresh caps into a catalog entry (list-row and info paths share this). */
+function applyCapsToEntry(entry: CatalogEntry, caps: ModelCapabilities): void {
+	entry.capabilities = slimCaps({
+		...(asCaps(entry.capabilities as ModelCapabilities) || {}),
+		...caps,
+	});
+	if (caps.contextWindow) entry.contextWindow = caps.contextWindow;
+	if (caps.maxOutput) entry.maxTokens = caps.maxOutput;
+	if (caps.vision) entry.input = ["text", "image"];
+	if (caps.reasoning != null) entry.reasoning = caps.reasoning;
+}
+
 /**
  * Enrich thin catalog rows via /v1/models/info.
  * Rows that already look rich (name + caps from list) are skipped.
@@ -550,16 +534,7 @@ async function enrichCatalog(
 				named++;
 			}
 			const caps = fillModelCaps(entry.id, asCaps(remote.capabilities) || {});
-			if (caps) {
-				entry.capabilities = slimCaps({
-					...(asCaps(entry.capabilities as ModelCapabilities) || {}),
-					...caps,
-				});
-				if (caps.contextWindow) entry.contextWindow = caps.contextWindow;
-				if (caps.maxOutput) entry.maxTokens = caps.maxOutput;
-				if (caps.vision) entry.input = ["text", "image"];
-				if (caps.reasoning != null) entry.reasoning = caps.reasoning;
-			}
+			if (Object.keys(caps).length) applyCapsToEntry(entry, caps);
 			if (remote.kind?.trim()) entry.detailKind = remote.kind.trim();
 			if (Array.isArray(remote.params) && remote.params.length) entry.params = remote.params;
 			skipped++;
@@ -600,16 +575,7 @@ async function enrichCatalog(
 		if (info.endpoint?.trim()) entry.endpoint = info.endpoint.trim();
 		if (Array.isArray(info.params) && info.params.length) entry.params = info.params;
 		const caps = fillModelCaps(entry.id, asCaps(info.capabilities) || {});
-		if (caps) {
-			entry.capabilities = slimCaps({
-				...(asCaps(entry.capabilities as ModelCapabilities) || {}),
-				...caps,
-			});
-			if (caps.contextWindow) entry.contextWindow = caps.contextWindow;
-			if (caps.maxOutput) entry.maxTokens = caps.maxOutput;
-			if (caps.vision) entry.input = ["text", "image"];
-			if (caps.reasoning != null) entry.reasoning = caps.reasoning;
-		}
+		if (Object.keys(caps).length) applyCapsToEntry(entry, caps);
 	}
 
 	return { named, missing, skipped, fetched, infoById };
@@ -736,8 +702,6 @@ export async function fetchAllAndBuild(
 	opts: {
 		signal?: AbortSignal;
 		mode?: SyncMode;
-		/** @deprecated use mode; kept for older callers */
-		enrichChatInfo?: boolean;
 		onProgress?: (msg: string) => void;
 	} = {},
 ): Promise<SyncResult> {
@@ -850,23 +814,16 @@ export async function fetchAllAndBuild(
 		}
 	}
 
-	let infoById = new Map<string, RemoteModel>();
-	let namedByServer = catalog.filter((c) => c.namedByServer).length;
-	let infoFetched = 0;
-	let infoSkipped = 0;
-
-	if (opts.enrichChatInfo !== false) {
-		const tInfo = Date.now();
-		const enriched = await enrichCatalog(endpoint, apiKey, catalog, remotesByKey, {
-			signal: opts.signal,
-			onProgress: opts.onProgress,
-		});
-		timings.enrich = Date.now() - tInfo;
-		infoById = enriched.infoById;
-		namedByServer = enriched.named;
-		infoFetched = enriched.fetched;
-		infoSkipped = enriched.skipped;
-	}
+	const tInfo = Date.now();
+	const enriched = await enrichCatalog(endpoint, apiKey, catalog, remotesByKey, {
+		signal: opts.signal,
+		onProgress: opts.onProgress,
+	});
+	timings.enrich = Date.now() - tInfo;
+	const infoById = enriched.infoById;
+	const namedByServer = enriched.named;
+	const infoFetched = enriched.fetched;
+	const infoSkipped = enriched.skipped;
 
 	let voiceSkipped: string[] = [];
 	let voiceAdded = 0;
@@ -1005,9 +962,10 @@ export async function diagnoseConnection(
 
 // ── Provider registration ───────────────────────────────────────
 
-function registerWithPi(pi: ExtensionAPI, config: Config, chatModels: PiModelDef[]): void {
+function registerWithPi(pi: ExtensionAPI, config: Config, models: PiModelDef[]): void {
 	const endpoint = normalizeEndpoint(config.endpoint);
 	const apiKey = resolveApiKey(config.apiKey);
+	let chatModels = models;
 
 	if (!chatModels.length) {
 		try {
@@ -1033,16 +991,21 @@ function registerWithPi(pi: ExtensionAPI, config: Config, chatModels: PiModelDef
 			contextWindow: m.contextWindow,
 			maxTokens: m.maxTokens,
 			...(m.compat ? { compat: m.compat } : {}),
-			...(m.thinkingLevelMap ? { thinkingLevelMap: m.thinkingLevelMap } : {}),
 		})),
 		// Live discovery hook (docs/extensions.md): pi calls this during model
-		// refresh. Quick chat-only fetch — no enrich, no config write. Errors fall
-		// back to the cached models so the provider is never emptied by a bad
-		// refresh. The durable catalog stays owned by the /9router sync flow.
-		async refreshModels(context: { signal?: AbortSignal } & Record<string, unknown>) {
-			const list = await fetchKind(endpoint, apiKey, "chat", context?.signal);
-			if (!list.ok || !list.models.length) return chatModels;
-			return list.models.map((m) => toPiModel(m));
+		// refresh. Quick chat-only fetch — no enrich. Successful refreshes are
+		// persisted back to 9router.json (chatModels only; the durable catalog
+		// stays owned by the /9router sync flow) and become the new fallback,
+		// so a later failed refresh never wipes the provider.
+		async refreshModels(context: { signal: AbortSignal; allowNetwork?: boolean }) {
+			if (context.allowNetwork === false) return chatModels;
+			const list = await fetchKind(endpoint, apiKey, "chat", context.signal);
+			if (list.ok && list.models.length) {
+				chatModels = list.models.map((m) => toPiModel(m));
+				saveJsonMerge({ chatModels });
+				return chatModels;
+			}
+			return chatModels;
 		},
 	});
 }
@@ -1062,6 +1025,13 @@ function applySyncToConfig(config: Config, sync: SyncResult): Config {
 
 // ── TUI ─────────────────────────────────────────────────────────
 
+/** One-line API key display: masked, env fallback, or "(not set)". */
+function describeKey(apiKey?: string, notSetText = "(not set — ok if 9Router auth off)"): string {
+	if (apiKey) return maskedKey(apiKey);
+	if (process.env.NINEROUTER_KEY) return maskedKey(process.env.NINEROUTER_KEY) + " (env)";
+	return notSetText;
+}
+
 function statusLines(config: Config): string[] {
 	const counts = config.counts || {};
 	const chat = config.chatModels?.length ?? counts.chat ?? 0;
@@ -1069,7 +1039,7 @@ function statusLines(config: Config): string[] {
 	const footerOn = isFooterEnabled();
 	const lines = [
 		`Endpoint:  ${config.endpoint}`,
-		`API key:   ${config.apiKey ? maskedKey(config.apiKey) : process.env.NINEROUTER_KEY ? maskedKey(process.env.NINEROUTER_KEY) + " (env)" : "(not set — ok if 9Router auth off)"}`,
+		`API key:   ${describeKey(config.apiKey)}`,
 		`Last sync: ${config.lastSync || "never"}${config.lastSyncMode ? ` (${config.lastSyncMode})` : ""}${stale ? "  ⚠ stale (>24h)" : ""}`,
 		`Chat registered: ${chat}`,
 		`Footer:    ${footerOn ? "on" : "off"}`,
@@ -1256,7 +1226,7 @@ async function runNineRouterUI(pi: ExtensionAPI, ctx: ExtensionContext): Promise
 		const footerOn = isFooterEnabled();
 		const header = [
 			`Endpoint  ${config.endpoint}`,
-			`Key       ${config.apiKey ? maskedKey(config.apiKey) : process.env.NINEROUTER_KEY ? maskedKey(process.env.NINEROUTER_KEY) + " (env)" : "not set"}`,
+			`Key       ${describeKey(config.apiKey, "not set")}`,
 			`Chat      ${chatN} registered · last sync ${synced}${config.lastSyncMode ? ` (${config.lastSyncMode})` : ""}${stale ? " ⚠" : ""}`,
 			`Footer    ${footerOn ? "on" : "off"}`,
 		].join("\n");
@@ -1305,7 +1275,7 @@ async function runNineRouterUI(pi: ExtensionAPI, ctx: ExtensionContext): Promise
 			while (true) {
 				const sub = await ui.select("Connection", [
 					`Endpoint: ${config.endpoint}`,
-					`API key: ${config.apiKey ? maskedKey(config.apiKey) : process.env.NINEROUTER_KEY ? "env NINEROUTER_KEY" : "not set"}`,
+					`API key: ${describeKey(config.apiKey, "not set")}`,
 					"Test connection",
 					"Clear API key",
 					"Back",

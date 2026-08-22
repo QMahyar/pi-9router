@@ -31,7 +31,49 @@ Do **not** put machine-only paths or secrets here — those stay in gitignored `
 
 ### Notes
 
-- Nothing in flight — 1.2.5 shipped the model-metadata fix.
+- Nothing in flight — 1.2.6 shipped the review-driven fixes + typecheck/tests/CI.
+
+---
+
+## [1.2.6] — 2026-08-22
+
+### Fixed
+
+- **Config writes are now atomic** (`extensions/lib/shared.ts`): `saveJsonMerge` writes to a temp file + `rename`s it, so a crash or a concurrent write from the other 9router extension can no longer truncate `~/.pi/agent/9router.json` (which previously silently reset all state). Config files also get `0600` permissions where the OS supports it.
+- Removed the unconditional `saveRaw({})` on every `session_start` (legacy-key strip now runs only when legacy keys are actually present — `hasLegacyKeys`), eliminating a read-modify-write race window between the two extensions on every session start.
+- `nr_image_generate` no longer saves JSON error bodies as corrupt `.png` files when the server answers 200-with-JSON on the binary path (`bodyIsJson` content-type/`{`-sniff guard, same as the TTS path).
+- Definitive 401/402/403 responses now abort the image fallback chain immediately instead of burning up to 3 upstream paid requests per image.
+- `nr_tts` parses a JSON body received on the binary path (`{audio, format}` or an error object) instead of re-requesting the synthesis with `?response_format=json` — no more paying twice when the server responds with JSON on the binary request.
+- `refreshModels` (the `pi update --models` hook) now **persists** successful refreshes back to `9router.json` and uses the refreshed list as the new error fallback — previously the closure was frozen at registration time and refreshes never converged. Also honors `allowNetwork: false`.
+- Changing a default model in `/9router-tools` re-registers the tools immediately so tool descriptions ("Default model: X") no longer go stale until the next sync.
+- Inline images (`attachImages: true`) used the Anthropic wire shape (`source: {…}`) instead of pi's `ImageContent` (`{type, data, mimeType}`) — found by the new typecheck; embedded images would never have rendered.
+
+### Changed
+
+- Output files (`nr_image_generate`, `nr_tts`) no longer silently overwrite same-named existing files — collisions get a `-1`, `-2`… suffix (`writeBytes`, exclusive `wx` create).
+- Image edit/reference payload sends `image` only (was `image` + duplicated base64 in `images[]`, doubling the request size).
+- `loadImageRef` caps reference images at 20 MB (both disk and inline base64) before reading into memory.
+- Temp artifacts (`web-search-*.txt`) use 64-bit random suffixes (was 24-bit).
+- `nr_embed` rejects non-array/empty `data` responses with a clear error instead of emitting nonsense rows.
+- `withTimeout` detaches its parent-signal listener on abort (no long-lived closure retention).
+
+### Added
+
+- **Type checking**: `tsconfig.json` (strict) + `npm run typecheck` (`tsc --noEmit`) — first real typecheck for this package; fixed all findings (including the `ImageContent` bug above).
+- **Offline unit tests**: `tests/` (58 tests, `bun test`) covering `resolveModel`/`describeModels`, `globMatch`/`fillModelCaps`/`mapThinkingCompat`, `asCaps`/`listRowIsRich`, `normalizeEndpoint`, atomic `saveJsonMerge` + legacy-strip, `mapConcurrent`, footer formatting, and the `CAPS`/`TOOL_CAP_DEFAULTS` consistency invariant.
+- **CI**: `.github/workflows/ci.yml` — bun install (frozen lockfile) + typecheck + unit tests on every push/PR. Live-server E2E stays local by design.
+- `package.json`: `scripts` (`typecheck`, `test`, `e2e`), devDependencies for typecheck/tests, peer floor `@earendil-works/pi-coding-agent >=0.82.0`.
+
+### Refactored
+
+- Deduplicated the two entry files into `lib/shared.ts`: `CatalogEntry` (was two drifting copies), `CAPS` + `CapDef` + `CapId` (footer's `TOOL_CAP_DEFAULTS` is now **derived** from `CAPS` instead of hand-synced), `VOICE_PROVIDER_PREFIXES`, `safeFilename` (was 6 inline copies of the sanitize regex). `CAPS` remains re-exported from `9router-tools.ts` for scripts.
+- `9router.ts`: extracted `applyCapsToEntry` (caps-merge block was copy-pasted twice in `enrichCatalog`) and `describeKey` (masked-key display was repeated 3×); removed dead code (`thinkingLevelMap` plumbing that no branch ever produced, `|| 8192` fallback, deprecated `enrichChatInfo` option).
+
+### Notes
+
+- Full-codebase review round (code + upstream 9Router v0.5.55 docs + pi 0.84 extension API) drove this release; feature gaps (video tool, image-edit params, extra search params) deliberately deferred to a later release.
+- Verified locally: `bun run typecheck` clean, `bun test` 58/58, live e2e 23/24 — the one failure is the known server-side `nanobanana-flash` "credits insufficient" 502 (account out of credits), unrelated to these changes.
+- Loose files copied to `~/.pi/agent/extensions` — `/reload` in pi to pick up.
 
 ---
 

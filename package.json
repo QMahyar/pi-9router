@@ -1,6 +1,6 @@
 {
   "name": "@qmahyar/pi-9router",
-  "version": "1.2.5",
+  "version": "1.2.6",
   "description": "Connect pi to 9Router — multi-provider chat models plus image, speech, search, and fetch tools",
   "keywords": [
     "pi-package",
@@ -26,12 +26,24 @@
     "type": "git",
     "url": "git+https://github.com/QMahyar/pi-9router.git"
   },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "e2e": "bun run scripts/e2e-test.ts"
+  },
   "files": [
     "extensions",
     "docs",
     "README.md",
     "LICENSE"
   ],
+  "devDependencies": {
+    "@types/bun": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*",
+    "typescript": "^5"
+  },
   "pi": {
     "extensions": [
       "./extensions/9router.ts",
@@ -39,7 +51,7 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-coding-agent": ">=0.82.0",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   }
