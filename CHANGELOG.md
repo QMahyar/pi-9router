@@ -31,7 +31,28 @@ Do **not** put machine-only paths or secrets here — those stay in gitignored `
 
 ### Notes
 
-- **git is ahead of npm**: 1.2.6 committed + pushed (`c578aac`) but `npm publish` needs an OTP. Retry later with `npm publish --access public --otp=<code>` — do **not** re-bump the version. Verify with `npm view @qmahyar/pi-9router version`.
+- Nothing in flight — 1.2.7 shipped the tier-4 feature set (video, STT, edit/search params).
+- **npm behind git**: 1.2.6 (`c578aac`) and 1.2.7 both need one publish — `npm publish --access public --otp=<code>` publishes the current version (1.2.7) directly; no need to publish 1.2.6 separately.
+
+---
+
+## [1.2.7] — 2026-08-22
+
+### Added
+
+- **`nr_video_generate`** (on by default) — Grok Imagine video generation via `POST /v1/videos/generations`: text-to-video or image-to-video (`image_path`), optional `duration`/`aspect_ratio`/`resolution`/`filename`. Async create→poll (`GET /v1/videos/{request_id}` echoing the create response's `x-9router-connection-id` header) → download MP4 to the media output dir; progress streams via `onUpdate`; 10-minute deadline. Creation is never retried (billing); 403 reports the "account has no video access" cause. There is no `/v1/models/video` list endpoint — the default model is the documented `xai/grok-imagine-video` and `model` overrides pass through verbatim.
+- **`nr_stt`** (off by default) — transcription of local audio files (mp3/wav/m4a/webm/ogg/flac, ≤25 MB) via multipart `POST /v1/audio/transcriptions`; `response_format` json/text/verbose_json/srt/vtt. STT catalog now synced from `/v1/models/stt` (added to full-sync kinds; empty list is fine when no provider is connected). Saved `stt` capability state is no longer treated as legacy.
+- `nr_image_generate`: `image_paths` (2–4 references) for multi-image edit — single reference still sends `image`, multiple send `images[]`.
+- `nr_web_search`: `time_range` (day/week/month/year) and `domain_filter` (comma-separated domains).
+
+### Changed
+
+- `postJson` now returns response headers (needed for the video connection id); `httpGetJson` accepts extra headers; new `postMultipart` helper for file uploads; `TIMEOUT.video` = 10 min.
+- `nr_stt` is deliberately off by default (voice→editor dictation remains out of scope; this tool is for transcribing existing files).
+
+### Verified
+
+- `bun run typecheck` clean · `bun test` 59/59 · live e2e 23/24 (only failure remains the server-side nanobanana credits 502). Video e2e is opt-in (`NR_E2E_VIDEO=1`, billed); STT e2e skips when no provider is connected (this server: none).
 
 ---
 

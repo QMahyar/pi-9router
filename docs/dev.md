@@ -29,7 +29,14 @@ rich skip `/v1/models/info`; thin rows (image, web, …) still get a lookup for
 image-to-text, enriches, probes voice TTS. Quick sync fetches chat only and keeps
 previous non-chat catalog entries so tools keep working.
 
-**STT** is not fetched (no STT tools in this package).
+**STT** is synced from `/v1/models/stt` (may be empty when no provider is
+connected). `nr_stt` ships **off** by default — enable in `/9router-tools`.
+
+**Video** has no `/v1/models` list endpoint; `nr_video_generate` defaults to
+the documented `xai/grok-imagine-video` and passes `model` through verbatim.
+Create → poll `GET /v1/videos/{request_id}` (echoing the create response's
+`x-9router-connection-id` header) → download MP4. Creation is never retried
+(billing); poll failures are tolerated until the 10-minute deadline.
 
 **Synthetic entries.** `edge-tts` / `google-tts` are added locally (`synthetic: true`)
 after a `/v1/audio/speech` probe returns real audio.
@@ -57,7 +64,8 @@ collision).
 **`model` on the wire** is not always the catalog id: search/fetch take a bare
 provider name (`exa`, not `exa/search`).
 
-**Timeouts** (shared): health 8s · list 45s · info 12s · probe 20s · tools 120s.
+**Timeouts** (shared): health 8s · list 45s · info 12s · probe 20s · tools 120s ·
+video (async, polled) 10min.
 
 **Stale catalog:** lastSync older than 24h shows a warning in status / session footer.
 
@@ -77,7 +85,7 @@ bun test
 bun build extensions/9router.ts extensions/9router-tools.ts \
   --target=node --external '*' --outdir "$LOCALAPPDATA/Temp/nrbuild"
 
-# live E2E (9Router must be running)
+# live E2E (9Router must be running); video creation is opt-in: NR_E2E_VIDEO=1
 bun run e2e
 ```
 

@@ -23,6 +23,8 @@ export const TIMEOUT = {
 	probe: 20_000,
 	tool: 120_000,
 	download: 60_000,
+	/** Video generation is async + polled — allow minutes, not seconds. */
+	video: 600_000,
 } as const;
 
 /** Warn when lastSync is older than this. */
@@ -92,7 +94,7 @@ export const VOICE_PROVIDER_PREFIXES: readonly string[] = ["edge-tts", "google-t
 
 // ── Capability tools (single source for both extensions) ────────
 
-export type CapId = "image" | "tts" | "embed" | "web_search" | "web_fetch";
+export type CapId = "image" | "tts" | "embed" | "web_search" | "web_fetch" | "video" | "stt";
 
 export interface CapDef {
 	id: CapId;
@@ -146,6 +148,22 @@ export const CAPS: CapDef[] = [
 		defaultEnabled: true,
 		blurb: "URL → markdown",
 	},
+	{
+		id: "video",
+		tool: "nr_video_generate",
+		label: "Video generation",
+		catalogKind: (e) => e.kind === "video",
+		defaultEnabled: true,
+		blurb: "Text/image → video file",
+	},
+	{
+		id: "stt",
+		tool: "nr_stt",
+		label: "Speech to text",
+		catalogKind: "stt",
+		defaultEnabled: false,
+		blurb: "Audio file → transcript",
+	},
 ];
 
 // ── Config I/O ──────────────────────────────────────────────────
@@ -183,19 +201,12 @@ function basenameOf(path: string): string {
 
 /** Legacy keys dropped from older installs; their presence triggers a rewrite. */
 export function hasLegacyKeys(raw: Record<string, unknown> = loadJsonFile()): boolean {
-	if ("voice" in raw || "ffmpegPath" in raw) return true;
-	const caps = raw.capabilities as Record<string, unknown> | undefined;
-	return Boolean(caps && "stt" in caps);
+	return "voice" in raw || "ffmpegPath" in raw;
 }
 
 function stripLegacyKeys(next: Record<string, unknown>): Record<string, unknown> {
 	delete next.voice;
 	delete next.ffmpegPath;
-	if (next.capabilities && typeof next.capabilities === "object") {
-		const caps = { ...(next.capabilities as Record<string, unknown>) };
-		delete caps.stt;
-		next.capabilities = caps;
-	}
 	return next;
 }
 
@@ -403,13 +414,13 @@ export function authHeaders(apiKey: string, json = false): Record<string, string
 export async function httpGetJson<T>(
 	url: string,
 	apiKey: string,
-	opts: { signal?: AbortSignal; timeoutMs?: number } = {},
+	opts: { signal?: AbortSignal; timeoutMs?: number; headers?: Record<string, string> } = {},
 ): Promise<{ ok: true; data: T } | { ok: false; status: number; error: string }> {
 	const signal = withTimeout(opts.timeoutMs ?? TIMEOUT.list, opts.signal);
 	try {
 		const res = await fetch(url, {
 			method: "GET",
-			headers: authHeaders(apiKey, true),
+			headers: { ...authHeaders(apiKey, true), ...(opts.headers || {}) },
 			signal,
 		});
 		if (!res.ok) {
@@ -447,7 +458,10 @@ export async function postJson(
 	apiKey: string,
 	body: unknown,
 	opts: { signal?: AbortSignal; timeoutMs?: number } = {},
-): Promise<{ ok: true; status: number; data: any } | { ok: false; status: number; error: string }> {
+): Promise<
+	| { ok: true; status: number; data: any; headers: Record<string, string> }
+	| { ok: false; status: number; error: string }
+> {
 	const signal = withTimeout(opts.timeoutMs ?? TIMEOUT.tool, opts.signal);
 	try {
 		const res = await fetch(url, {
@@ -470,7 +484,55 @@ export async function postJson(
 					: data?.error?.message || data?.message || JSON.stringify(data).slice(0, 400);
 			return { ok: false, status: res.status, error: msg || res.statusText };
 		}
-		return { ok: true, status: res.status, data };
+		const headers: Record<string, string> = {};
+		res.headers.forEach((v, k) => {
+			headers[k] = v;
+		});
+		return { ok: true, status: res.status, data, headers };
+	} catch (err) {
+		return { ok: false, status: 0, error: errMsg(err) };
+	}
+}
+
+/**
+ * Multipart upload (e.g. /v1/audio/transcriptions). `form` carries files;
+ * fetch sets the multipart Content-Type boundary itself.
+ * Returns raw text + content-type so text/srt/vtt responses work too.
+ */
+export async function postMultipart(
+	url: string,
+	apiKey: string,
+	form: FormData,
+	opts: { signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<
+	| { ok: true; status: number; text: string; contentType: string }
+	| { ok: false; status: number; error: string }
+> {
+	const signal = withTimeout(opts.timeoutMs ?? TIMEOUT.tool, opts.signal);
+	try {
+		const res = await fetch(url, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${apiKey}`, Accept: "*/*" },
+			body: form,
+			signal,
+		});
+		const text = await res.text();
+		if (!res.ok) {
+			let msg = text.slice(0, 400);
+			try {
+				const data = JSON.parse(text);
+				msg = data?.error?.message || data?.message || msg;
+			} catch {
+				/* plain text error */
+			}
+			return { ok: false, status: res.status, error: msg || res.statusText };
+		}
+		return {
+			ok: true,
+			status: res.status,
+			text,
+			contentType: res.headers.get("content-type") || "text/plain",
+		};
 	} catch (err) {
 		return { ok: false, status: 0, error: errMsg(err) };
 	}

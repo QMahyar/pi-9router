@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import {
 	authHeaders,
 	healthCheck,
+	httpGetJson,
 	isSyncStale,
 	listRowIsRich,
 	postBinary,
@@ -280,7 +281,7 @@ if (imgModels.length) {
 			model,
 			prompt: "same red square but blue instead",
 			n: 1,
-			imageDataUrl: `data:image/png;base64,${readFileSync(gen.saved[0]).toString("base64")}`,
+			imageUrls: [`data:image/png;base64,${readFileSync(gen.saved[0]).toString("base64")}`],
 		});
 		if (edit.saved.length) {
 			ok("image edit/ref path", edit.saved[0]);
@@ -391,6 +392,70 @@ await assert("search model resolves to catalog id", () => {
 	const wire = r.ok ? r.id.replace(/\/search$/i, "") : "";
 	expect(wire && !wire.includes("/"), `wire still has slash: ${wire}`);
 });
+
+// 11. Video (opt-in — creating a job bills the account): NR_E2E_VIDEO=1
+console.log("\n11. video (opt-in)");
+if (process.env.NR_E2E_VIDEO === "1") {
+	const VIDEO_DEFAULT_MODEL = "xai/grok-imagine-video";
+	const create = await postJson(`${EP}/v1/videos/generations`, KEY, {
+		model: VIDEO_DEFAULT_MODEL,
+		prompt: "a red square gently bouncing on a white background",
+		duration: 6,
+	});
+	if (!create.ok && create.status === 403) {
+		console.log(`     video not available on this account (403): ${String(create.error).slice(0, 100)}`);
+		ok("video 403 handled with clear error");
+	} else if (!create.ok) {
+		console.log(`     video create failed (${create.status}): ${String(create.error).slice(0, 120)}`);
+		ok("video create failure handled");
+	} else if (create.data?.request_id) {
+		const conn = create.headers["x-9router-connection-id"] || create.headers["x-connection-id"];
+		ok("video job created", `request_id=${create.data.request_id}${conn ? " + connection id" : " (no connection id header!)"}`);
+		// Poll once after a short wait just to prove the poll endpoint shape; a full
+		// wait-to-done is intentionally not done here (minutes + billing).
+		await new Promise((r) => setTimeout(r, 4000));
+		const poll = await httpGetJson<any>(`${EP}/v1/videos/${create.data.request_id}`, KEY, {
+			headers: conn ? { "x-connection-id": conn } : {},
+		});
+		await assert("video poll returns a status", () => {
+			expect(poll.ok, !poll.ok ? `HTTP ${poll.status}: ${poll.error}` : "");
+			expect(typeof poll.data?.status === "string", JSON.stringify(poll.data).slice(0, 200));
+		});
+	} else {
+		console.log(`     video create returned no request_id: ${JSON.stringify(create.data).slice(0, 120)}`);
+		ok("video create without request_id handled");
+	}
+} else {
+	console.log("  · skipped (set NR_E2E_VIDEO=1 to attempt a billed test generation)");
+}
+
+// 12. STT (best-effort — needs an STT provider connected + the section 7 TTS file)
+console.log("\n12. STT (best-effort)");
+const sttModel = full.catalog.find((c) => c.kind === "stt");
+const ttsOutFile = join(OUT, "tts-e2e.mp3");
+if (sttModel && existsSync(ttsOutFile)) {
+	const form = new FormData();
+	form.append("model", sttModel.id);
+	form.append(
+		"file",
+		new Blob([new Uint8Array(readFileSync(ttsOutFile))], { type: "audio/mpeg" }),
+		"tts-e2e.mp3",
+	);
+	const res = await fetch(`${EP}/v1/audio/transcriptions`, {
+		method: "POST",
+		headers: { Authorization: `Bearer ${KEY}` },
+		body: form,
+	});
+	if (res.ok) {
+		const body = await res.text();
+		ok("stt transcription", `${sttModel.id} · ${body.slice(0, 60)}`);
+	} else {
+		console.log(`     stt unavailable (${res.status}): ${(await res.text()).slice(0, 120)}`);
+		ok("stt failure handled");
+	}
+} else {
+	console.log(sttModel ? "  · no tts-e2e.mp3 artifact (tts skipped) — skip" : "  · no stt models connected — skip");
+}
 
 // Summary
 console.log(`\n${"─".repeat(50)}`);

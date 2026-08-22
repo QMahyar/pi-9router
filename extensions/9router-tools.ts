@@ -6,19 +6,24 @@
  * Tools (toggle in UI; off tools are removed from the model context):
  *   nr_image_generate  POST /v1/images/generations
  *   nr_tts             POST /v1/audio/speech
+ *   nr_video_generate  POST /v1/videos/generations (+ GET /v1/videos/{id} poll)
+ *   nr_stt             POST /v1/audio/transcriptions (multipart; default off)
  *   nr_embed           POST /v1/embeddings
  *   nr_web_search      POST /v1/search
  *   nr_web_fetch       POST /v1/web/fetch
  *
- * Speech-to-text / mic input is intentionally not included — use a dedicated
- * OS dictation app (e.g. Superwhisper, Spokenly) for voice → editor.
+ * Voice → editor dictation is still out of scope (use an OS dictation app);
+ * nr_stt covers transcribing existing audio files.
  *
  * Tool descriptions stay compact — they name the configured default model, not
  * the full catalog. A `model` argument is resolved against the catalog before
  * any request goes out; unknown ids are rejected with the available list.
+ * Video has no catalog list endpoint — its tool defaults to the documented
+ * `xai/grok-imagine-video` id and passes `model` through verbatim.
  *
- * Wire convention: /v1/images/generations, /v1/audio/speech, /v1/embeddings take
- * the full catalog id; /v1/search and /v1/web/fetch take a bare provider name.
+ * Wire convention: /v1/images/generations, /v1/audio/speech, /v1/embeddings,
+ * /v1/audio/transcriptions take the full catalog id; /v1/search and
+ * /v1/web/fetch take a bare provider name.
  *
  * Shared config: ~/.pi/agent/9router.json
  */
@@ -49,12 +54,14 @@ import {
 	downloadUrl,
 	footerFromConfig,
 	hasLegacyKeys,
+	httpGetJson,
 	isSyncStale,
 	loadJsonFile,
 	normalizeEndpoint,
 	paintFooterStatus,
 	postBinary,
 	postJson,
+	postMultipart,
 	resolveApiKey,
 	safeFilename,
 	saveJsonMerge,
@@ -470,8 +477,6 @@ function applyToolActivation(pi: ExtensionAPI, cfg: ToolsConfigSlice): void {
 	const active = new Set(pi.getActiveTools());
 	const allKnown = new Set(pi.getAllTools().map((t) => t.name));
 
-	active.delete("nr_stt");
-
 	for (const cap of CAPS) {
 		if (!allKnown.has(cap.tool)) continue;
 		if (getCapState(cfg, cap).enabled) active.add(cap.tool);
@@ -603,7 +608,6 @@ async function runToolsUI(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void
 		const stale = isSyncStale(cfg.lastSync);
 		const header = cfg.catalog?.length
 			? `Synced · ${Object.entries(cfg.counts || {})
-					.filter(([k]) => k !== "stt")
 					.map(([k, v]) => `${k} ${v}`)
 					.join(" · ")}${stale ? " · ⚠ stale" : ""}`
 			: "Catalog empty — run /9router → Sync models";
@@ -719,18 +723,19 @@ async function generateImages(opts: {
 	size?: string;
 	quality?: string;
 	filename?: string;
-	/** data URL or local path already loaded as data URL */
-	imageDataUrl?: string;
+	/** data URL(s) for edit/img2img — 1 sends `image`, 2+ sends `images[]` */
+	imageUrls?: string[];
 	signal?: AbortSignal;
 }): Promise<{ saved: string[]; error?: string }> {
-	const { ep, key, outDir, model, prompt, n, size, quality, filename, imageDataUrl, signal } = opts;
+	const { ep, key, outDir, model, prompt, n, size, quality, filename, imageUrls, signal } = opts;
 	const saved: string[] = [];
 	const count = Math.min(Math.max(1, n), 4);
 
 	const baseBody: Record<string, unknown> = { model, prompt, n: 1 };
 	if (size) baseBody.size = size;
 	if (quality) baseBody.quality = quality;
-	if (imageDataUrl) baseBody.image = imageDataUrl;
+	if (imageUrls?.length === 1) baseBody.image = imageUrls[0];
+	else if (imageUrls && imageUrls.length > 1) baseBody.images = imageUrls;
 
 	for (let i = 0; i < count; i++) {
 		// Prefer binary (raw bytes) — matches skill default for saving files
@@ -848,13 +853,13 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 		description: withModelHint(
 			cfg,
 			cap,
-			"Generate an image through 9Router and save it to disk. Best for icons, logos, illustrations, UI mockups, and concept art. Optional image_path enables edit/img2img when the model supports it. Returns the saved file path; the image itself is not embedded in the result by default.",
+			"Generate an image through 9Router and save it to disk. Best for icons, logos, illustrations, UI mockups, and concept art. Optional image_path / image_paths enable edit/img2img with 1–4 reference images when the model supports it. Returns the saved file path; the image itself is not embedded in the result by default.",
 		),
 		promptSnippet: "Generate an image (9Router) and save the file path",
 		promptGuidelines: [
 			"Call nr_image_generate to create images, icons, logos, illustrations, or mockups.",
 			"Write a detailed prompt (subject, style, colors, composition).",
-			"Omit model unless the user names a specific image model; when they do, pass its exact catalog id (browse via /9router-tools if unsure). Optional size, quality, n (1–4), filename, image_path (local path for edit/img2img).",
+			"Omit model unless the user names a specific image model; when they do, pass its exact catalog id (browse via /9router-tools if unsure). Optional size, quality, n (1–4), filename, image_path (single reference image for edit/img2img), image_paths (up to 4 references).",
 			"Tell the user the saved file path from the tool result.",
 			"The image is not embedded in the result — read the returned path if you need to see it.",
 		],
@@ -870,6 +875,12 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 					description: "Local path (or data URL) of a reference image for edit/img2img when the model supports it",
 				}),
 			),
+			image_paths: Type.Optional(
+				Type.Array(Type.String(), {
+					maxItems: 4,
+					description: "Multiple reference images for edit/img2img (1–4); use image_path for a single one",
+				}),
+			),
 		}),
 		prepareArguments(args) {
 			if (!args || typeof args !== "object") return args as never;
@@ -879,6 +890,16 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 				const rest: Record<string, unknown> = { ...input };
 				delete rest.imagePath;
 				rest.image_path = input.imagePath;
+				return rest as never;
+			}
+			if (
+				input.image_paths === undefined &&
+				Array.isArray(input.imagePaths) &&
+				input.imagePaths.every((p) => typeof p === "string")
+			) {
+				const rest: Record<string, unknown> = { ...input };
+				delete rest.imagePaths;
+				rest.image_paths = input.imagePaths;
 				return rest as never;
 			}
 			return args as never;
@@ -896,22 +917,24 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			const outDir = outputDirOf(cfg);
 			const n = Math.min(params.n ?? 1, 4);
 
-			let imageDataUrl: string | undefined;
-			if (params.image_path?.trim()) {
-				const loaded = await loadImageRef(params.image_path, ctx.cwd);
+			const refsRaw = [
+				...(params.image_path?.trim() ? [params.image_path] : []),
+				...(Array.isArray(params.image_paths) ? params.image_paths.filter((p) => p?.trim()) : []),
+			].slice(0, 4);
+			const imageUrls: string[] = [];
+			for (const ref of refsRaw) {
+				const loaded = await loadImageRef(ref, ctx.cwd);
 				if (!loaded) {
-					return toolError(`Could not read image_path: ${params.image_path}`, {
-						image_path: params.image_path,
-					});
+					return toolError(`Could not read reference image: ${ref}`, { image_path: ref });
 				}
-				imageDataUrl = loaded;
+				imageUrls.push(loaded);
 			}
 
 			onUpdate?.({
 				content: [
 					{
 						type: "text",
-						text: `Generating ${n} image(s) with ${model}${imageDataUrl ? " (edit/ref)" : ""}…`,
+						text: `Generating ${n} image(s) with ${model}${imageUrls.length ? ` (${imageUrls.length} ref image${imageUrls.length > 1 ? "s" : ""})` : ""}…`,
 					},
 				],
 				details: {},
@@ -927,7 +950,7 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 				size: params.size,
 				quality: params.quality,
 				filename: params.filename,
-				imageDataUrl,
+				imageUrls,
 				signal,
 			});
 
@@ -937,7 +960,7 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			const text = [
 				`Generated ${saved.length} image(s) · ${model}`,
 				picked.note ? `Model ${picked.note}` : "",
-				params.image_path ? `Reference: ${params.image_path}` : "",
+				refsRaw.length ? `Reference${refsRaw.length > 1 ? "s" : ""}: ${refsRaw.join(", ")}` : "",
 				`Prompt: ${params.prompt}`,
 				error ? `Note: ${error}` : "",
 				...saved.map((p) => `File: ${p}`),
@@ -981,7 +1004,7 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 					n: saved.length,
 					cwd: ctx.cwd,
 					attached,
-					image_path: params.image_path,
+					imageRefs: refsRaw.length ? refsRaw : undefined,
 				},
 			};
 		},
@@ -1213,7 +1236,7 @@ function registerWebSearchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 		promptGuidelines: [
 			"Call nr_web_search for current web info, docs, news, or sources.",
 			"Write a clear natural-language query. Omit model unless the user names a provider (e.g. exa/search).",
-			"Optional: max_results (default 5), search_type (web|news), country, language.",
+			"Optional: max_results (default 5), search_type (web|news), country, language, time_range (day|week|month|year), domain_filter (comma-separated domains).",
 			"Follow up with nr_web_fetch on the best URLs when you need full page content.",
 			"Do not use nr_web_search for local codebase questions.",
 		],
@@ -1224,6 +1247,12 @@ function registerWebSearchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			search_type: Type.Optional(Type.String({ description: "web or news when supported" })),
 			country: Type.Optional(Type.String({ description: "Country bias when supported" })),
 			language: Type.Optional(Type.String({ description: "Language bias when supported" })),
+			time_range: Type.Optional(
+				Type.String({ description: "Restrict by recency when supported, e.g. day, week, month, year" }),
+			),
+			domain_filter: Type.Optional(
+				Type.String({ description: "Comma-separated domains to restrict to, when supported" }),
+			),
 		}),
 		async execute(_id, params, signal, onUpdate) {
 			const cfg = loadRaw();
@@ -1243,6 +1272,8 @@ function registerWebSearchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			if (params.search_type) body.search_type = params.search_type;
 			if (params.country) body.country = params.country;
 			if (params.language) body.language = params.language;
+			if (params.time_range) body.time_range = params.time_range;
+			if (params.domain_filter) body.domain_filter = params.domain_filter;
 			const res = await postJson(`${endpointOf(cfg)}/v1/search`, apiKeyOf(cfg), body, {
 				signal,
 				timeoutMs: TIMEOUT.tool,
@@ -1362,11 +1393,320 @@ function registerWebFetchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 	});
 }
 
+// ── Video (Grok Imagine) ────────────────────────────────────────
+
+/**
+ * 9Router has no /v1/models/video list endpoint — this documented id is the
+ * default; `model` overrides pass through verbatim.
+ */
+const VIDEO_DEFAULT_MODEL = "xai/grok-imagine-video";
+const VIDEO_POLL_INTERVAL_MS = 3_000;
+
+interface VideoJob {
+	status: string;
+	progress?: number;
+	video?: { url?: string; duration?: number };
+	error?: { code?: string; message?: string };
+}
+
+function registerVideoTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
+	const cap = CAPS.find((c) => c.id === "video")!;
+	pi.registerTool({
+		name: cap.tool,
+		label: "Video",
+		description:
+			"Generate a short video through 9Router (Grok Imagine) and save it as an MP4. Text-to-video, or image-to-video with an optional image_path reference. Generation is async — the tool polls until done (up to 10 minutes) and returns the saved file path. Expensive per generation; use deliberately, not for experiments.",
+		promptSnippet: "Generate a video (9Router/Grok Imagine) and save the MP4",
+		promptGuidelines: [
+			"Call nr_video_generate only when the user explicitly asks for a video.",
+			"Write a concrete prompt (subject, motion, style, scene). Optional duration (seconds), aspect_ratio, resolution, image_path for image-to-video.",
+			"Generation takes tens of seconds to minutes — set expectations, do not spam retries.",
+			"Report the saved MP4 path when done.",
+		],
+		parameters: Type.Object({
+			prompt: Type.String({ description: "Video description: subject, motion, style, scene" }),
+			model: Type.Optional(
+				Type.String({ description: `Video model id (optional; default ${VIDEO_DEFAULT_MODEL})` }),
+			),
+			duration: Type.Optional(
+				Type.Integer({ description: "Length in seconds when supported", minimum: 1, maximum: 60 }),
+			),
+			aspect_ratio: Type.Optional(
+				Type.Union(
+					["16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3"].map((v) => Type.Literal(v)),
+					{ description: "Aspect ratio when supported" },
+				),
+			),
+			resolution: Type.Optional(
+				Type.Union(["480p", "720p", "1080p"].map((v) => Type.Literal(v)), {
+					description: "Resolution when supported",
+				}),
+			),
+			image_path: Type.Optional(
+				Type.String({ description: "Local path (or data URL) of a reference image for image-to-video" }),
+			),
+			filename: Type.Optional(Type.String({ description: "Output file name only, no folders (.mp4 appended)" })),
+		}),
+		async execute(_id, params, signal, onUpdate, ctx) {
+			const cfg = loadRaw();
+			const blocked = needCap(cfg, cap);
+			if (blocked) return toolError(blocked);
+			const model = params.model?.trim() || VIDEO_DEFAULT_MODEL;
+
+			const ep = endpointOf(cfg);
+			const key = apiKeyOf(cfg);
+			const outDir = outputDirOf(cfg);
+
+			let imageUrl: string | undefined;
+			if (params.image_path?.trim()) {
+				imageUrl = (await loadImageRef(params.image_path, ctx.cwd)) ?? undefined;
+				if (!imageUrl) {
+					return toolError(`Could not read image_path: ${params.image_path}`, {
+						image_path: params.image_path,
+					});
+				}
+			}
+
+			const body: Record<string, unknown> = { model, prompt: params.prompt };
+			if (params.duration) body.duration = params.duration;
+			if (params.aspect_ratio) body.aspect_ratio = params.aspect_ratio;
+			if (params.resolution) body.resolution = params.resolution;
+			if (imageUrl) body.image = { url: imageUrl };
+
+			onUpdate?.({
+				content: [{ type: "text", text: `Submitting video job · ${model}…` }],
+				details: {},
+			});
+			const create = await postJson(`${ep}/v1/videos/generations`, key, body, {
+				signal,
+				timeoutMs: TIMEOUT.tool,
+			});
+			if (!create.ok) {
+				if (create.status === 403) {
+					return toolError(
+						`Video generation refused (403): the connected xAI account has no video access (needs SuperGrok/X Premium+ or an xAI API key with video quota).`,
+						{ model },
+					);
+				}
+				return toolError(`Video job submission failed (${create.status}): ${create.error}`, { model });
+			}
+			const requestId = create.data?.request_id;
+			if (!requestId) {
+				return toolError(`Video job submission returned no request_id: ${JSON.stringify(create.data).slice(0, 200)}`, { model });
+			}
+			// Jobs are account-bound — polls must carry the creating connection id.
+			const connectionId =
+				create.headers["x-9router-connection-id"] || create.headers["x-connection-id"];
+
+			const deadline = Date.now() + TIMEOUT.video;
+			let lastProgress = -1;
+			while (Date.now() < deadline) {
+				if (signal?.aborted) return toolError("Video generation aborted.", { model, request_id: requestId });
+				await new Promise((r) => setTimeout(r, VIDEO_POLL_INTERVAL_MS));
+				const poll = await httpGetJson<VideoJob>(
+					`${ep}/v1/videos/${encodeURIComponent(requestId)}`,
+					key,
+					{
+						signal,
+						timeoutMs: TIMEOUT.info,
+						...(connectionId ? { headers: { "x-connection-id": connectionId } } : {}),
+					},
+				);
+				if (!poll.ok) {
+					// Transient poll failures are tolerated; the deadline bounds the wait.
+					continue;
+				}
+				const job = poll.data || ({} as VideoJob);
+				if (job.progress != null && job.progress !== lastProgress) {
+					lastProgress = job.progress;
+					onUpdate?.({
+						content: [{ type: "text", text: `Video ${job.status || "pending"} · ${job.progress}%` }],
+						details: {},
+					});
+				}
+				if (job.status === "done" && job.video?.url) {
+					const dl = await downloadUrl(job.video.url, { signal, timeoutMs: TIMEOUT.download });
+					if (!dl) return toolError("Video completed but the download failed.", { model, request_id: requestId, url: job.video.url });
+					const name = withExt(
+						params.filename ? safeFilename(params.filename) : `video-${stamp()}-${slug(params.prompt)}`,
+						".mp4",
+					);
+					const path = await writeBytes(outDir, name, dl.bytes);
+					return toolOk(
+						[
+							"Video saved.",
+							`Model: ${model}`,
+							`File: ${path}`,
+							job.video.duration ? `Duration: ${job.video.duration}s` : "",
+							`Prompt: ${params.prompt}`,
+						]
+							.filter(Boolean)
+							.join("\n"),
+						{ model, file: path, url: job.video.url, duration: job.video.duration, request_id: requestId },
+					);
+				}
+				if (job.status === "failed") {
+					return toolError(
+						`Video generation failed${job.error?.code ? ` (${job.error.code})` : ""}: ${job.error?.message || "no error detail"}`,
+						{ model, request_id: requestId },
+					);
+				}
+			}
+			return toolError(`Video generation timed out after ${Math.round(TIMEOUT.video / 1000)}s — the job may still finish; check the 9Router dashboard.`, {
+				model,
+				request_id: requestId,
+			});
+		},
+		renderResult(result, { expanded }, theme) {
+			const d = (result.details || {}) as { file?: string; request_id?: string };
+			return compactResult("nr_video_generate", d.file || d.request_id || "", theme, expanded, textFromResult(result));
+		},
+	});
+}
+
+// ── Speech-to-text ───────────────────────────────────────────────
+
+/** Cap on transcription uploads — matches OpenAI's Whisper limit. */
+const MAX_STT_BYTES = 25 * 1024 * 1024;
+const STT_MEDIA: Record<string, string> = {
+	".mp3": "audio/mpeg",
+	".wav": "audio/wav",
+	".m4a": "audio/mp4",
+	".webm": "audio/webm",
+	".ogg": "audio/ogg",
+	".flac": "audio/flac",
+};
+
+function registerSttTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
+	const cap = CAPS.find((c) => c.id === "stt")!;
+	pi.registerTool({
+		name: cap.tool,
+		label: "Transcribe",
+		description: withModelHint(
+			cfg,
+			cap,
+			"Transcribe an audio file (mp3/wav/m4a/webm/ogg/flac) through 9Router. Returns the transcript text; srt/vtt formats include timestamps. Off by default — enable in /9router-tools.",
+		),
+		promptSnippet: "Transcribe an audio file (9Router)",
+		promptGuidelines: [
+			"Call nr_stt when the user wants an audio or video soundtrack file transcribed.",
+			"Pass a local file path in file_path. Optional language hint and response_format (json default; srt/vtt for subtitles).",
+			"Omit model unless the user names one.",
+		],
+		parameters: Type.Object({
+			file_path: Type.String({ description: "Local path to the audio file (mp3, wav, m4a, webm, ogg, flac; ≤25 MB)" }),
+			model: Type.Optional(Type.String({ description: "STT model id (optional)" })),
+			language: Type.Optional(Type.String({ description: "ISO-639-1 language hint, e.g. en, vi" })),
+			prompt: Type.Optional(Type.String({ description: "Hint text to guide transcription" })),
+			response_format: Type.Optional(
+				Type.Union(
+					["json", "text", "verbose_json", "srt", "vtt"].map((v) => Type.Literal(v)),
+					{ description: "Output format (default json)" },
+				),
+			),
+			temperature: Type.Optional(Type.Number({ description: "0–1 sampling temperature", minimum: 0, maximum: 1 })),
+		}),
+		async execute(_id, params, signal, onUpdate) {
+			const cfg = loadRaw();
+			const blocked = needCap(cfg, cap);
+			if (blocked) return toolError(blocked);
+			const picked = resolveModel(cfg, cap, params.model);
+			if (!picked.ok) {
+				return toolError(picked.message, { requested: params.model });
+			}
+			const model = picked.id;
+
+			const target = params.file_path.trim().replace(/^@/, "");
+			const abs = isAbsolute(target) ? target : resolve(process.cwd(), target);
+			let bytes: Buffer;
+			try {
+				const st = await stat(abs);
+				if (st.size > MAX_STT_BYTES) {
+					return toolError(`Audio file too large (${Math.round(st.size / 1024 / 1024)} MB; limit 25 MB).`, {
+						file_path: params.file_path,
+					});
+				}
+				bytes = await readFile(abs);
+			} catch {
+				return toolError(`Could not read audio file: ${params.file_path}`, { file_path: params.file_path });
+			}
+
+			const ext = extname(abs).toLowerCase();
+			if (!STT_MEDIA[ext]) {
+				return toolError(
+					`Unsupported audio format "${ext}" — expected mp3, wav, m4a, webm, ogg, or flac.`,
+					{ file_path: params.file_path },
+				);
+			}
+
+			onUpdate?.({ content: [{ type: "text", text: `Transcribing · ${basename(abs)} · ${model}` }], details: {} });
+
+			const form = new FormData();
+			form.append("model", model);
+			form.append("file", new Blob([new Uint8Array(bytes)], { type: STT_MEDIA[ext] }), basename(abs));
+			if (params.language) form.append("language", params.language);
+			if (params.prompt) form.append("prompt", params.prompt);
+			if (params.response_format) form.append("response_format", params.response_format);
+			if (params.temperature != null) form.append("temperature", String(params.temperature));
+
+			const res = await postMultipart(`${endpointOf(cfg)}/v1/audio/transcriptions`, apiKeyOf(cfg), form, {
+				signal,
+				timeoutMs: TIMEOUT.tool,
+			});
+			if (!res.ok) return toolError(`Transcription failed (${res.status}): ${res.error}`, { model });
+
+			// json/verbose_json bodies carry {text}; text/srt/vtt are the payload itself.
+			let transcript = res.text;
+			let verbose: { language?: string; duration?: number; segments?: unknown[] } | undefined;
+			if (res.contentType.toLowerCase().includes("json") || res.text.trimStart().startsWith("{")) {
+				try {
+					const parsed = JSON.parse(res.text) as { text?: string; language?: string; duration?: number; segments?: unknown[] };
+					transcript = parsed.text ?? res.text;
+					verbose = parsed;
+				} catch {
+					/* keep raw text */
+				}
+			}
+			if (!transcript.trim()) return toolError("Transcription returned empty text.", { model });
+
+			const header = [
+				`File: ${abs}`,
+				`Model: ${model}`,
+				picked.note ? `Model ${picked.note}` : "",
+				verbose?.language ? `Language: ${verbose.language}` : "",
+				verbose?.duration ? `Duration: ${Math.round(verbose.duration)}s` : "",
+				verbose?.segments?.length ? `Segments: ${verbose.segments.length}` : "",
+			]
+				.filter(Boolean)
+				.join("\n");
+			const text = await truncateResult(`${header}\n\n${transcript}`, "stt", "head");
+			return toolOk(text, {
+				model,
+				file: abs,
+				chars: transcript.length,
+				format: params.response_format || "json",
+			});
+		},
+		renderResult(result, { expanded }, theme) {
+			const d = (result.details || {}) as { file?: string; chars?: number };
+			return compactResult(
+				"nr_stt",
+				`${d.chars ?? "?"} chars · ${d.file ? basename(d.file) : ""}`,
+				theme,
+				expanded,
+				textFromResult(result),
+			);
+		},
+	});
+}
+
 // ── Entry ───────────────────────────────────────────────────────
 
 function registerAllTools(pi: ExtensionAPI, cfg: ToolsConfigSlice): void {
 	registerImageTool(pi, cfg);
 	registerTtsTool(pi, cfg);
+	registerVideoTool(pi, cfg);
+	registerSttTool(pi, cfg);
 	registerEmbedTool(pi, cfg);
 	registerWebSearchTool(pi, cfg);
 	registerWebFetchTool(pi, cfg);

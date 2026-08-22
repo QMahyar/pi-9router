@@ -42,11 +42,13 @@ Requires a running [9Router](https://9router.com) instance (`npm i -g 9router` �
 
 | Tool | On by default | Does |
 |------|---------------|------|
-| `nr_image_generate` | Yes | Text → image file |
+| `nr_image_generate` | Yes | Text (or reference images) → image file |
 | `nr_tts` | Yes | Text → speech file |
+| `nr_video_generate` | Yes | Text/image → MP4 (Grok Imagine, async) |
 | `nr_web_search` | Yes | Live web search |
 | `nr_web_fetch` | Yes | URL → markdown |
 | `nr_embed` | No | Text → embeddings |
+| `nr_stt` | No | Audio file → transcript |
 
 **Off tools leave the model context.** Only enabled tools expose schema + usage guidelines to the agent.
 

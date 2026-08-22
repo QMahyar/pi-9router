@@ -61,11 +61,13 @@ const PROVIDER_ID = "9router";
 const PROVIDER_NAME = "9Router";
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const;
 
-/** Full multi-kind catalog (tools + browse). */
+/** Full multi-kind catalog (tools + browse). Video has no list endpoint —
+ *  its tool uses the documented `xai/grok-imagine-video` id directly. */
 const FULL_CATALOG_KINDS = [
 	"chat",
 	"image",
 	"tts",
+	"stt",
 	"embedding",
 	"web",
 	"image-to-text",
@@ -1044,7 +1046,7 @@ function statusLines(config: Config): string[] {
 		`Chat registered: ${chat}`,
 		`Footer:    ${footerOn ? "on" : "off"}`,
 	];
-	const extras = (["image", "tts", "embedding", "web", "image-to-text"] as const)
+	const extras = (["image", "tts", "stt", "embedding", "web", "image-to-text"] as const)
 		.map((k) => (counts[k] ? `${k}:${counts[k]}` : null))
 		.filter(Boolean);
 	if (extras.length) lines.push(`Catalog:   ${extras.join("  ")}`);

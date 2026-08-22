@@ -40,11 +40,13 @@ every later turn. Leave off unless you have a large-context vision model.
 
 | Tool | Label | Purpose |
 |------|-------|---------|
-| `nr_image_generate` | Image | Generate (or edit via `image_path`) and save |
+| `nr_image_generate` | Image | Generate (or edit via `image_path`/`image_paths`) and save |
 | `nr_tts` | Speech | Text → audio file |
+| `nr_video_generate` | Video | Text/image → MP4 via Grok Imagine (async, polls up to 10 min) |
 | `nr_web_search` | Search | Live web search |
 | `nr_web_fetch` | Fetch | URL → markdown |
 | `nr_embed` | Embed | Vectors (off by default) |
+| `nr_stt` | Transcribe | Audio file → transcript (off by default) |
 
 **On** → schema + short guidelines in the system prompt.  
 **Off** → removed from active tools; no mention in agent context.
@@ -69,8 +71,34 @@ Every tool takes an optional `model`. Omit it to use the default set in
 |-------|--------|
 | `n` | 1–4; each image is requested (binary path loops) |
 | `size` / `quality` | When the model supports them (see params in description) |
-| `image_path` | Local path or data URL for edit/img2img |
+| `image_path` | Local path or data URL for edit/img2img (single reference) |
+| `image_paths` | Up to 4 references for multi-image edit (sends `images[]`) |
 | `filename` | Output name only (single image) |
+
+## Video (Grok Imagine)
+
+`nr_video_generate` creates a job via `/v1/videos/generations`, polls until
+done, and saves the MP4 next to the other media output. There is no video
+model list endpoint — the default is the documented `xai/grok-imagine-video`
+and `model` overrides pass through verbatim. Requires an xAI account with
+video access (SuperGrok / X Premium+ or an xAI API key); a 403 means the
+connected account lacks it. Each generation is billed — the tool is described
+to the agent as deliberate-use only.
+
+| Param | Notes |
+|-------|--------|
+| `prompt` | Subject, motion, style, scene |
+| `duration` / `aspect_ratio` / `resolution` | When supported (e.g. 6, `16:9`, `720p`) |
+| `image_path` | Reference image for image-to-video |
+| `filename` | Output name only (`.mp4` appended) |
+
+## Transcription (STT)
+
+`nr_stt` (off by default) uploads a local audio file — mp3, wav, m4a, webm,
+ogg, or flac up to 25 MB — to `/v1/audio/transcriptions` and returns the
+transcript. `response_format` `srt`/`vtt` produce timestamped subtitles.
+Models come from `/v1/models/stt` (whisper, groq, gemini, deepgram, …) —
+connect a provider in the 9Router dashboard, then re-sync.
 
 ## Free TTS
 

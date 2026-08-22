@@ -94,7 +94,7 @@ describe("saveJsonMerge / loadJsonFile", () => {
 		expect((caps.image as Record<string, unknown>).model).toBe("m");
 		expect((caps.tts as Record<string, unknown>).enabled).toBe(false);
 	});
-	test("strips legacy keys only when present", () => {
+	test("strips voice/ffmpegPath but preserves stt capability state", () => {
 		const dir = mkdtempSync(join(tmpdir(), "nr-test-"));
 		const path = join(dir, "9router.json");
 		writeFileSync(
@@ -106,8 +106,9 @@ describe("saveJsonMerge / loadJsonFile", () => {
 		const out = saveJsonMerge({}, path);
 		expect("voice" in out).toBe(false);
 		expect("ffmpegPath" in out).toBe(false);
-		expect("stt" in (out.capabilities as object)).toBe(false);
-		expect((out.capabilities as Record<string, unknown>).image).toBeDefined();
+		const caps = out.capabilities as Record<string, unknown>;
+		expect(caps.stt).toEqual({ enabled: true }); // stt is a real capability again
+		expect(caps.image).toBeDefined();
 		expect(hasLegacyKeys(out)).toBe(false);
 	});
 	test("clean files report no legacy keys so callers can skip rewriting", () => {
@@ -176,6 +177,12 @@ describe("TOOL_CAP_DEFAULTS derived from CAPS", () => {
 		for (const cap of CAPS) {
 			expect(TOOL_CAP_DEFAULTS[cap.id]).toBe(cap.defaultEnabled);
 		}
+	});
+	test("video on by default, stt off by default", () => {
+		expect(TOOL_CAP_DEFAULTS.video).toBe(true);
+		expect(TOOL_CAP_DEFAULTS.stt).toBe(false);
+		expect(CAPS.find((c) => c.id === "video")?.tool).toBe("nr_video_generate");
+		expect(CAPS.find((c) => c.id === "stt")?.tool).toBe("nr_stt");
 	});
 });
 
