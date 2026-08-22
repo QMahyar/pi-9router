@@ -32,7 +32,7 @@ Do **not** put machine-only paths or secrets here — those stay in gitignored `
 ### Notes
 
 - Nothing in flight — 1.2.7 shipped the tier-4 feature set (video, STT, edit/search params).
-- **npm behind git**: 1.2.6 (`c578aac`) and 1.2.7 both need one publish — `npm publish --access public --otp=<code>` publishes the current version (1.2.7) directly; no need to publish 1.2.6 separately.
+- **git is ahead of npm**: 1.2.6 (`c578aac`) and 1.2.7 (`5159315`) are pushed but unpublished (OTP required). Run once: `npm publish --access public --otp=<code>` — it publishes the current version (1.2.7); no need to publish 1.2.6 separately. Verify with `npm view @qmahyar/pi-9router version`.
 
 ---
 
