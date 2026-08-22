@@ -218,10 +218,13 @@ export function saveJsonMerge(
 	const cur = loadJsonFile(path);
 	const next: Record<string, unknown> = { ...cur, ...patch };
 	if (patch.capabilities && typeof patch.capabilities === "object") {
-		next.capabilities = {
-			...((cur.capabilities as Record<string, unknown>) || {}),
-			...(patch.capabilities as Record<string, unknown>),
-		};
+		const curCaps = (cur.capabilities as Record<string, Record<string, unknown>>) || {};
+		const patchCaps = patch.capabilities as Record<string, Record<string, unknown>>;
+		const merged: Record<string, unknown> = { ...curCaps };
+		for (const [k, v] of Object.entries(patchCaps)) {
+			merged[k] = { ...(curCaps[k] || {}), ...(v as Record<string, unknown>) };
+		}
+		next.capabilities = merged;
 	}
 	stripLegacyKeys(next);
 	writeJsonAtomic(path, next);
@@ -390,6 +393,31 @@ export function withTimeout(timeoutMs: number, parent?: AbortSignal): AbortSigna
 	return ctrl.signal;
 }
 
+/** Create a timeout-bound signal with explicit cleanup — caller must call `clear()` when done. */
+function createTimeoutSignal(timeoutMs: number, parent?: AbortSignal): { signal: AbortSignal; clear: () => void } {
+	const ctrl = new AbortController();
+	let timer: ReturnType<typeof setTimeout> | undefined = setTimeout(
+		() => ctrl.abort(new Error(`timeout after ${timeoutMs}ms`)),
+		timeoutMs,
+	);
+	const onParent = () => {
+		if (timer) clearTimeout(timer);
+		timer = undefined;
+		ctrl.abort(parent?.reason ?? new Error("aborted"));
+	};
+	if (parent) {
+		if (parent.aborted) onParent();
+		else parent.addEventListener("abort", onParent, { once: true });
+	}
+	const clear = () => {
+		if (timer) clearTimeout(timer);
+		timer = undefined;
+		parent?.removeEventListener("abort", onParent);
+	};
+	ctrl.signal.addEventListener("abort", clear, { once: true });
+	return { signal: ctrl.signal, clear };
+}
+
 function errMsg(err: unknown): string {
 	if (!err) return "unknown error";
 	if (err instanceof Error) {
@@ -416,7 +444,7 @@ export async function httpGetJson<T>(
 	apiKey: string,
 	opts: { signal?: AbortSignal; timeoutMs?: number; headers?: Record<string, string> } = {},
 ): Promise<{ ok: true; data: T } | { ok: false; status: number; error: string }> {
-	const signal = withTimeout(opts.timeoutMs ?? TIMEOUT.list, opts.signal);
+	const { signal, clear } = createTimeoutSignal(opts.timeoutMs ?? TIMEOUT.list, opts.signal);
 	try {
 		const res = await fetch(url, {
 			method: "GET",
@@ -425,10 +453,14 @@ export async function httpGetJson<T>(
 		});
 		if (!res.ok) {
 			const body = (await res.text()).slice(0, 240);
+			clear();
 			return { ok: false, status: res.status, error: body || res.statusText };
 		}
-		return { ok: true, data: (await res.json()) as T };
+		const data = (await res.json()) as T;
+		clear();
+		return { ok: true, data };
 	} catch (err) {
+		clear();
 		return { ok: false, status: 0, error: errMsg(err) };
 	}
 }
@@ -437,7 +469,7 @@ export async function healthCheck(
 	endpoint: string,
 	opts: { signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<{ ok: boolean; error?: string; ms?: number }> {
-	const signal = withTimeout(opts.timeoutMs ?? TIMEOUT.health, opts.signal);
+	const { signal, clear } = createTimeoutSignal(opts.timeoutMs ?? TIMEOUT.health, opts.signal);
 	const t0 = Date.now();
 	try {
 		const res = await fetch(`${normalizeEndpoint(endpoint)}/api/health`, {
@@ -445,10 +477,15 @@ export async function healthCheck(
 			headers: { Accept: "application/json" },
 		});
 		const ms = Date.now() - t0;
-		if (!res.ok) return { ok: false, error: `HTTP ${res.status}`, ms };
+		if (!res.ok) {
+			clear();
+			return { ok: false, error: `HTTP ${res.status}`, ms };
+		}
 		const data = (await res.json()) as { ok?: boolean };
+		clear();
 		return { ok: data.ok === true, ms, error: data.ok === true ? undefined : "health.ok !== true" };
 	} catch (err) {
+		clear();
 		return { ok: false, error: errMsg(err), ms: Date.now() - t0 };
 	}
 }
@@ -462,7 +499,7 @@ export async function postJson(
 	| { ok: true; status: number; data: any; headers: Record<string, string> }
 	| { ok: false; status: number; error: string }
 > {
-	const signal = withTimeout(opts.timeoutMs ?? TIMEOUT.tool, opts.signal);
+	const { signal, clear } = createTimeoutSignal(opts.timeoutMs ?? TIMEOUT.tool, opts.signal);
 	try {
 		const res = await fetch(url, {
 			method: "POST",
@@ -482,14 +519,17 @@ export async function postJson(
 				typeof data === "string"
 					? data.slice(0, 400)
 					: data?.error?.message || data?.message || JSON.stringify(data).slice(0, 400);
+			clear();
 			return { ok: false, status: res.status, error: msg || res.statusText };
 		}
 		const headers: Record<string, string> = {};
 		res.headers.forEach((v, k) => {
 			headers[k] = v;
 		});
+		clear();
 		return { ok: true, status: res.status, data, headers };
 	} catch (err) {
+		clear();
 		return { ok: false, status: 0, error: errMsg(err) };
 	}
 }
@@ -508,7 +548,7 @@ export async function postMultipart(
 	| { ok: true; status: number; text: string; contentType: string }
 	| { ok: false; status: number; error: string }
 > {
-	const signal = withTimeout(opts.timeoutMs ?? TIMEOUT.tool, opts.signal);
+	const { signal, clear } = createTimeoutSignal(opts.timeoutMs ?? TIMEOUT.tool, opts.signal);
 	try {
 		const res = await fetch(url, {
 			method: "POST",
@@ -525,8 +565,10 @@ export async function postMultipart(
 			} catch {
 				/* plain text error */
 			}
+			clear();
 			return { ok: false, status: res.status, error: msg || res.statusText };
 		}
+		clear();
 		return {
 			ok: true,
 			status: res.status,
@@ -534,6 +576,7 @@ export async function postMultipart(
 			contentType: res.headers.get("content-type") || "text/plain",
 		};
 	} catch (err) {
+		clear();
 		return { ok: false, status: 0, error: errMsg(err) };
 	}
 }
@@ -547,7 +590,7 @@ export async function postBinary(
 	| { ok: true; status: number; bytes: Uint8Array; contentType: string }
 	| { ok: false; status: number; error: string }
 > {
-	const signal = withTimeout(opts.timeoutMs ?? TIMEOUT.tool, opts.signal);
+	const { signal, clear } = createTimeoutSignal(opts.timeoutMs ?? TIMEOUT.tool, opts.signal);
 	try {
 		const res = await fetch(url, {
 			method: "POST",
@@ -557,15 +600,19 @@ export async function postBinary(
 		});
 		if (!res.ok) {
 			const text = (await res.text()).slice(0, 400);
+			clear();
 			return { ok: false, status: res.status, error: text || res.statusText };
 		}
+		const bytes = new Uint8Array(await res.arrayBuffer());
+		clear();
 		return {
 			ok: true,
 			status: res.status,
-			bytes: new Uint8Array(await res.arrayBuffer()),
+			bytes,
 			contentType: res.headers.get("content-type") || "application/octet-stream",
 		};
 	} catch (err) {
+		clear();
 		return { ok: false, status: 0, error: errMsg(err) };
 	}
 }
@@ -574,15 +621,21 @@ export async function downloadUrl(
 	url: string,
 	opts: { signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<{ bytes: Uint8Array; contentType: string } | null> {
-	const signal = withTimeout(opts.timeoutMs ?? TIMEOUT.download, opts.signal);
+	const { signal, clear } = createTimeoutSignal(opts.timeoutMs ?? TIMEOUT.download, opts.signal);
 	try {
 		const res = await fetch(url, { signal });
-		if (!res.ok) return null;
-		return {
+		if (!res.ok) {
+			clear();
+			return null;
+		}
+		const out = {
 			bytes: new Uint8Array(await res.arrayBuffer()),
 			contentType: res.headers.get("content-type") || "application/octet-stream",
 		};
+		clear();
+		return out;
 	} catch {
+		clear();
 		return null;
 	}
 }

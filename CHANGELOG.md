@@ -31,8 +31,23 @@ Do **not** put machine-only paths or secrets here — those stay in gitignored `
 
 ### Notes
 
-- Nothing in flight — 1.2.7 shipped the tier-4 feature set (video, STT, edit/search params).
-- **git is ahead of npm**: 1.2.6 (`c578aac`) and 1.2.7 (`5159315`) are pushed but unpublished (OTP required). Run once: `npm publish --access public --otp=<code>` — it publishes the current version (1.2.7); no need to publish 1.2.6 separately. Verify with `npm view @qmahyar/pi-9router version`.
+- None — 1.2.8 fixes pending publish (OTP required). See below: git ahead of npm remains for 1.2.6–1.2.8 until publish succeeds.
+
+---
+
+## [1.2.8] — 2026-08-22
+
+### Fixed
+
+- **`nr_stt` cwd bug**: `execute()` missed the `ctx` arg and resolved relative `file_path` against `process.cwd()` instead of the pi session `ctx.cwd` — transcription failed when the session cwd differed from the process cwd. Now `ctx.cwd` with `process.cwd()` fallback.
+- **HTTP timeout leak**: `withTimeout` cleared its timer only on abort, not on success — every `httpGetJson`/`postJson`/`postBinary`/`postMultipart`/`downloadUrl`/`healthCheck` left a dangling timer until it fired (up to 120s). Added `createTimeoutSignal` with explicit `clear()` after headers/body consumption and on all `!res.ok` branches.
+- **`capabilities` merge loss**: `saveJsonMerge` shallow-merged `capabilities` (`{...curCaps, ...patchCaps}`) replaced a whole capability record — toggling `enabled` without re-passing `model` dropped the saved model. Now deep-merges per capability id (`{...curCaps[k], ...patchCaps[k]}`).
+- **Video poll abort delay**: `nr_video_generate` slept `VIDEO_POLL_INTERVAL_MS` (3s) with a plain `setTimeout` that ignored `signal` — abort during poll waited up to 3s. Now abort-aware promise that clears the timer and rejects on `signal` abort.
+
+### Verified
+
+- `bun run typecheck` clean · `bun test` 59/59 · `bun build` ok.
+
 
 ---
 

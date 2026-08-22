@@ -1502,7 +1502,17 @@ function registerVideoTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			let lastProgress = -1;
 			while (Date.now() < deadline) {
 				if (signal?.aborted) return toolError("Video generation aborted.", { model, request_id: requestId });
-				await new Promise((r) => setTimeout(r, VIDEO_POLL_INTERVAL_MS));
+				try {
+					await new Promise<void>((resolve, reject) => {
+						const t = setTimeout(resolve, VIDEO_POLL_INTERVAL_MS);
+						if (signal) {
+							signal.addEventListener("abort", () => { clearTimeout(t); reject(signal.reason ?? new Error("aborted")); }, { once: true });
+							if (signal.aborted) { clearTimeout(t); reject(signal.reason ?? new Error("aborted")); }
+						}
+					});
+				} catch {
+					return toolError("Video generation aborted.", { model, request_id: requestId });
+				}
 				const poll = await httpGetJson<VideoJob>(
 					`${ep}/v1/videos/${encodeURIComponent(requestId)}`,
 					key,
@@ -1606,7 +1616,7 @@ function registerSttTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			),
 			temperature: Type.Optional(Type.Number({ description: "0–1 sampling temperature", minimum: 0, maximum: 1 })),
 		}),
-		async execute(_id, params, signal, onUpdate) {
+		async execute(_id, params, signal, onUpdate, ctx) {
 			const cfg = loadRaw();
 			const blocked = needCap(cfg, cap);
 			if (blocked) return toolError(blocked);
@@ -1617,7 +1627,8 @@ function registerSttTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			const model = picked.id;
 
 			const target = params.file_path.trim().replace(/^@/, "");
-			const abs = isAbsolute(target) ? target : resolve(process.cwd(), target);
+			const cwd = (ctx as { cwd?: string })?.cwd || process.cwd();
+			const abs = isAbsolute(target) ? target : resolve(cwd, target);
 			let bytes: Buffer;
 			try {
 				const st = await stat(abs);
