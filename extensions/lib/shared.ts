@@ -3,7 +3,7 @@
  * Not an extension entry point (no default export) — only imported.
  */
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { randomBytes } from "node:crypto";
@@ -29,6 +29,34 @@ export const TIMEOUT = {
 
 /** Warn when lastSync is older than this. */
 export const STALE_SYNC_MS = 24 * 60 * 60 * 1000;
+
+/** Negative info-cache TTL — skip re-probing ids the server doesn't know. */
+export const INFO_MISSING_TTL = 24 * 60 * 60 * 1000;
+
+/**
+ * Positive info-cache TTL — reuse a fetched /v1/models/info record for 7d.
+ * Stored in 9router.json as `infoCache` (`kind\0id` → { fetchedAt, info }),
+ * unified with the 24 h negative `infoMissing` cache: saveJsonMerge
+ * union-merges both maps key-wise (merge-safe across the two extensions)
+ * and prunes expired entries on every write so the blob stays bounded.
+ */
+export const INFO_CACHE_TTL = 7 * 24 * 60 * 60 * 1000;
+
+export interface InfoCacheEntry {
+	fetchedAt: number;
+	info: RemoteModel;
+}
+
+export function isInfoCacheFresh(
+	entry: InfoCacheEntry | undefined,
+	now: number = Date.now(),
+): boolean {
+	return (
+		!!entry &&
+		typeof entry.fetchedAt === "number" &&
+		now - entry.fetchedAt < INFO_CACHE_TTL
+	);
+}
 
 // ── Types ───────────────────────────────────────────────────────
 
@@ -79,6 +107,21 @@ export interface CatalogEntry {
 	synthetic?: boolean;
 	note?: string;
 	registered?: boolean;
+	/**
+	 * Quick-sync aging (ticket 3): consecutive syncs this entry was carried
+	 * over without being confirmed by a list fetch. Full sync rebuilds from
+	 * fresh lists, so present entries come back clean and deleted ones prune.
+	 */
+	absentSyncs?: number;
+	/** True once absentSyncs hits the threshold — run a full sync to confirm. */
+	stale?: boolean;
+	/**
+	 * Caps provenance: true when any caps field was filled from the local
+	 * MODEL_PATTERN_CAPS fallback table (live list row + /v1/models/info
+	 * both left gaps). Browse shows this as a "pattern fallback" vs
+	 * "live server info" badge; sync reports the fallback-hit count.
+	 */
+	capsFromPattern?: boolean;
 	contextWindow?: number;
 	maxTokens?: number;
 	reasoning?: boolean;
@@ -210,25 +253,173 @@ function stripLegacyKeys(next: Record<string, unknown>): Record<string, unknown>
 	return next;
 }
 
+/** Plain-record guard for boundary validation (arrays and null are not records). */
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Validate `infoMissing` (bare-id → timestamp) on load. Drops non-numeric
+ *  (NaN/null/string), non-finite, and expired entries; string/array blobs
+ *  become empty maps so enrich/merge/reload never crash or resurrect. */
+export function sanitizeInfoMissing(value: unknown, now: number = Date.now()): Record<string, number> | undefined {
+	if (value === undefined) return undefined;
+	if (!isPlainRecord(value)) return {};
+	const out: Record<string, number> = {};
+	for (const [id, ts] of Object.entries(value)) {
+		if (typeof ts !== "number" || !Number.isFinite(ts)) continue;
+		if (now - ts >= INFO_MISSING_TTL) continue;
+		out[id] = ts;
+	}
+	return out;
+}
+
+/** Boundary constructor: rebuild a RemoteModel from untrusted cache data.
+ *  Picks only known fields with per-field checks, so a malformed record can
+ *  never smuggle an illegal shape past the boundary (no casts). Unknown
+ *  extra keys are dropped; mistyped optionals fall back to absent. */
+export function toCachedInfo(value: unknown): RemoteModel | undefined {
+	if (!isPlainRecord(value) || typeof value.id !== "string") return undefined;
+	const info: RemoteModel = { id: value.id };
+	for (const key of ["object", "owned_by", "name", "kind", "endpoint"] as const) {
+		if (typeof value[key] === "string") info[key] = value[key];
+	}
+	if (Array.isArray(value.capabilities)) {
+		info.capabilities = value.capabilities;
+	} else if (isPlainRecord(value.capabilities)) {
+		info.capabilities = value.capabilities;
+	}
+	if (Array.isArray(value.params) && value.params.every((p) => typeof p === "string")) {
+		info.params = value.params;
+	}
+	if (value.options !== undefined) info.options = value.options;
+	if (typeof value.created === "number" && Number.isFinite(value.created)) {
+		info.created = value.created;
+	}
+	return info;
+}
+
+/** Validate `infoCache` (`kind\0id` → { fetchedAt, info }) on load. Drops
+ *  non-record entries, non-finite/expired timestamps, and non-record info
+ *  (including { info: null }) so malformed records never resurrect. */
+export function sanitizeInfoCache(
+	value: unknown,
+	now: number = Date.now(),
+): Record<string, InfoCacheEntry> | undefined {
+	if (value === undefined) return undefined;
+	if (!isPlainRecord(value)) return {};
+	const out: Record<string, InfoCacheEntry> = {};
+	for (const [id, entry] of Object.entries(value)) {
+		if (!isPlainRecord(entry)) continue;
+		const fetchedAt: unknown = entry.fetchedAt;
+		if (typeof fetchedAt !== "number" || !Number.isFinite(fetchedAt)) continue;
+		if (now - fetchedAt >= INFO_CACHE_TTL) continue;
+		const info = toCachedInfo(entry.info);
+		if (!info) continue;
+		out[id] = { fetchedAt, info };
+	}
+	return out;
+}
+
+/** Validate `modelNames` (chat id → friendly name) on load. Keeps only
+ *  non-empty strings; string/array blobs become empty maps. */
+export function sanitizeModelNames(value: unknown): Record<string, string> | undefined {
+	if (value === undefined) return undefined;
+	if (!isPlainRecord(value)) return {};
+	const out: Record<string, string> = {};
+	for (const [id, name] of Object.entries(value)) {
+		if (typeof name !== "string" || !name.trim()) continue;
+		out[id] = name.trim();
+	}
+	return out;
+}
+
 /** Deep-merge top-level keys; merges `capabilities` one level when both sides set it. */
 export function saveJsonMerge(
 	patch: Record<string, unknown>,
 	path: string = CONFIG_PATH,
 ): Record<string, unknown> {
-	const cur = loadJsonFile(path);
+	const loaded: unknown = loadJsonFile(path);
+	const cur: Record<string, unknown> = isPlainRecord(loaded) ? loaded : {};
 	const next: Record<string, unknown> = { ...cur, ...patch };
-	if (patch.capabilities && typeof patch.capabilities === "object") {
-		const curCaps = (cur.capabilities as Record<string, Record<string, unknown>>) || {};
-		const patchCaps = patch.capabilities as Record<string, Record<string, unknown>>;
+	if (isPlainRecord(patch.capabilities)) {
+		const curCaps: Record<string, unknown> = isPlainRecord(cur.capabilities) ? cur.capabilities : {};
+		const patchCaps: Record<string, unknown> = patch.capabilities;
 		const merged: Record<string, unknown> = { ...curCaps };
 		for (const [k, v] of Object.entries(patchCaps)) {
-			merged[k] = { ...(curCaps[k] || {}), ...(v as Record<string, unknown>) };
+			if (!isPlainRecord(v)) continue;
+			const base: Record<string, unknown> = isPlainRecord(curCaps[k]) ? (curCaps[k] as Record<string, unknown>) : {};
+			merged[k] = { ...base, ...v };
 		}
 		next.capabilities = merged;
 	}
+	// Merge-safe caches + names: union per-id keys (patch wins per key) so a
+	// concurrent write from the other extension never wipes fresh entries.
+	// refreshModels persists chatModels + modelNames from stale in-memory
+	// state — without the union a refresh would flush fresh on-disk names.
+	for (const key of ["infoCache", "infoMissing", "modelNames"] as const) {
+		if (isPlainRecord(patch[key])) {
+		const base: Record<string, unknown> = isPlainRecord(cur[key])
+			? (cur[key] as Record<string, unknown>)
+			: {};
+		next[key] = { ...base, ...(patch[key] as Record<string, unknown>) };
+		}
+	}
+	pruneInfoCaches(next);
 	stripLegacyKeys(next);
 	writeJsonAtomic(path, next);
 	return next;
+}
+
+/** Drop expired/malformed cache entries so the config blob stays bounded.
+ *  Non-numeric timestamps (NaN/null/string), non-record info entries
+ *  (including { info: null }), and non-string modelNames go — anything
+ *  malformed is dropped rather than risk resurrection across
+ *  enrich → prune → merge → reload. Non-record top-level blobs are removed. */
+function pruneInfoCaches(next: Record<string, unknown>, now: number = Date.now()): void {
+	const missing: unknown = next.infoMissing;
+	if (missing !== undefined) {
+		if (!isPlainRecord(missing)) {
+			delete next.infoMissing;
+		} else {
+			for (const [id, ts] of Object.entries(missing)) {
+				if (typeof ts !== "number" || !Number.isFinite(ts) || now - ts >= INFO_MISSING_TTL) {
+					delete missing[id];
+				}
+			}
+		}
+	}
+	const cache: unknown = next.infoCache;
+	if (cache !== undefined) {
+		if (!isPlainRecord(cache)) {
+			delete next.infoCache;
+		} else {
+			for (const [id, entry] of Object.entries(cache)) {
+				if (!isPlainRecord(entry)) {
+					delete cache[id];
+					continue;
+				}
+				const fetchedAt: unknown = entry.fetchedAt;
+				const info: unknown = entry.info;
+				if (typeof fetchedAt !== "number" || !Number.isFinite(fetchedAt) || now - fetchedAt >= INFO_CACHE_TTL) {
+					delete cache[id];
+					continue;
+				}
+				if (!isPlainRecord(info) || typeof info.id !== "string") {
+					delete cache[id];
+				}
+			}
+		}
+	}
+	const names: unknown = next.modelNames;
+	if (names !== undefined) {
+		if (!isPlainRecord(names)) {
+			delete next.modelNames;
+		} else {
+			for (const [id, name] of Object.entries(names)) {
+				if (typeof name !== "string" || !name.trim()) delete names[id];
+			}
+		}
+	}
 }
 
 export function normalizeEndpoint(endpoint?: string): string {
@@ -367,6 +558,95 @@ export function paintFooterStatus(ui: StatusUi, snap?: FooterSnapshot): void {
 	ui.setStatus(FOOTER_STATUS_ID, ui.theme.fg(tone, text));
 }
 
+// ── Usage log (cost/latency) ──────────────────────────────────────
+
+/**
+ * Bounded usage log next to the config (never in the repo).
+ * One JSON object per line: { ts, tool, model, ms, ok, status?, bytes?, count?, note? }.
+ * Writers never throw — a failed append must not break a tool call.
+ * Bounded: an append that pushes the file past MAX_USAGE_BYTES rewrites
+ * just the last MAX_USAGE_LINES lines, so the file (and every full-file
+ * read per status render) stays capped.
+ */
+export const USAGE_PATH = join(dirname(CONFIG_PATH), "9router-usage.jsonl");
+
+export const MAX_USAGE_BYTES = 256_000;
+export const MAX_USAGE_LINES = 1000;
+
+export interface UsageRecord {
+	tool: string;
+	model?: string;
+	ms?: number;
+	ok: boolean;
+	status?: number;
+	bytes?: number;
+	count?: number;
+	note?: string;
+}
+
+export interface UsageEntry extends UsageRecord {
+	ts: string;
+}
+
+export function logUsage(rec: UsageRecord, path: string = USAGE_PATH): void {
+	try {
+		const dir = dirname(path);
+		if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+		appendFileSync(path, JSON.stringify({ ts: new Date().toISOString(), ...rec }) + "\n");
+		pruneUsageLog(path);
+	} catch {
+		/* usage logging never breaks tools */
+	}
+}
+
+/** Rewrite the tail once the file exceeds MAX_USAGE_BYTES — never throws. */
+function pruneUsageLog(path: string): void {
+	try {
+		if (statSync(path).size <= MAX_USAGE_BYTES) return;
+		const lines = readFileSync(path, "utf-8").split("\n").filter(Boolean);
+		writeFileSync(path, lines.slice(-MAX_USAGE_LINES).join("\n") + "\n");
+	} catch {
+		/* pruning is best-effort; the next append retries */
+	}
+}
+
+/** Last `maxLines` parsed records (newest last); corrupt lines are skipped. */
+export function readUsageRecords(path: string = USAGE_PATH, maxLines = 200): UsageEntry[] {
+	try {
+		const lines = readFileSync(path, "utf-8").split("\n").filter(Boolean);
+		const out: UsageEntry[] = [];
+		for (const line of lines.slice(-maxLines)) {
+			try {
+				const r = JSON.parse(line) as UsageEntry;
+				if (r && typeof r.tool === "string") out.push(r);
+			} catch {
+			/* skip corrupt lines */
+			}
+		}
+		return out;
+	} catch {
+		return [];
+	}
+}
+
+function fmtMs(ms: number): string {
+	return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
+}
+
+/** One-line usage summary for status surfaces — undefined when never logged. */
+export function formatUsageSummary(path: string = USAGE_PATH): string | undefined {
+	const recs = readUsageRecords(path);
+	if (!recs.length) return undefined;
+	const ok = recs.filter((r) => r.ok).length;
+	const times = recs.filter((r) => typeof r.ms === "number").map((r) => r.ms as number);
+	const avg = times.length ? times.reduce((a, b) => a + b, 0) / times.length : undefined;
+	const last = recs[recs.length - 1];
+	const bits = [`Usage: ${recs.length} call${recs.length === 1 ? "" : "s"}`, `${Math.round((ok / recs.length) * 100)}% ok`];
+	if (avg != null) bits.push(`avg ${fmtMs(avg)}`);
+	bits.push(`last ${last.tool}${last.model ? ` ${last.model}` : ""}${typeof last.ms === "number" ? ` ${fmtMs(last.ms)}` : ""}`);
+	return bits.join(" · ");
+}
+
 // ── Abort / timeout ─────────────────────────────────────────────
 
 /** Combine optional parent signal with a timeout. */
@@ -439,10 +719,14 @@ export function authHeaders(apiKey: string, json = false): Record<string, string
 	return h;
 }
 
+/** Cap for `fullError` bodies (video 403/poll detail) — full enough for the
+ *  server explanation, bounded so a huge body can't blow up tool errors. */
+export const FULL_ERROR_MAX = 2048;
+
 export async function httpGetJson<T>(
 	url: string,
 	apiKey: string,
-	opts: { signal?: AbortSignal; timeoutMs?: number; headers?: Record<string, string> } = {},
+	opts: { signal?: AbortSignal; timeoutMs?: number; headers?: Record<string, string>; fullError?: boolean } = {},
 ): Promise<{ ok: true; data: T } | { ok: false; status: number; error: string }> {
 	const { signal, clear } = createTimeoutSignal(opts.timeoutMs ?? TIMEOUT.list, opts.signal);
 	try {
@@ -452,7 +736,8 @@ export async function httpGetJson<T>(
 			signal,
 		});
 		if (!res.ok) {
-			const body = (await res.text()).slice(0, 240);
+			// fullError keeps up to FULL_ERROR_MAX of server detail (video 403) — otherwise cap it.
+			const body = (await res.text()).slice(0, opts.fullError ? FULL_ERROR_MAX : 240);
 			clear();
 			return { ok: false, status: res.status, error: body || res.statusText };
 		}
@@ -494,7 +779,7 @@ export async function postJson(
 	url: string,
 	apiKey: string,
 	body: unknown,
-	opts: { signal?: AbortSignal; timeoutMs?: number } = {},
+	opts: { signal?: AbortSignal; timeoutMs?: number; fullError?: boolean } = {},
 ): Promise<
 	| { ok: true; status: number; data: any; headers: Record<string, string> }
 	| { ok: false; status: number; error: string }
@@ -515,10 +800,11 @@ export async function postJson(
 			data = text;
 		}
 		if (!res.ok) {
+			// fullError keeps up to FULL_ERROR_MAX of server detail (video 403) — otherwise cap it.
 			const msg =
 				typeof data === "string"
-					? data.slice(0, 400)
-					: data?.error?.message || data?.message || JSON.stringify(data).slice(0, 400);
+					? data.slice(0, opts.fullError ? FULL_ERROR_MAX : 400)
+					: data?.error?.message || data?.message || JSON.stringify(data).slice(0, opts.fullError ? FULL_ERROR_MAX : 400);
 			clear();
 			return { ok: false, status: res.status, error: msg || res.statusText };
 		}
@@ -617,26 +903,34 @@ export async function postBinary(
 	}
 }
 
+/**
+ * GET a URL to bytes. Failures keep the HTTP status (status 0 for
+ * network/abort) so callers can report and log it — never bare null.
+ */
 export async function downloadUrl(
 	url: string,
 	opts: { signal?: AbortSignal; timeoutMs?: number } = {},
-): Promise<{ bytes: Uint8Array; contentType: string } | null> {
+): Promise<
+	| { ok: true; bytes: Uint8Array; contentType: string }
+	| { ok: false; status: number; error: string }
+> {
 	const { signal, clear } = createTimeoutSignal(opts.timeoutMs ?? TIMEOUT.download, opts.signal);
 	try {
 		const res = await fetch(url, { signal });
 		if (!res.ok) {
 			clear();
-			return null;
+			return { ok: false, status: res.status, error: res.statusText || `HTTP ${res.status}` };
 		}
 		const out = {
+			ok: true as const,
 			bytes: new Uint8Array(await res.arrayBuffer()),
 			contentType: res.headers.get("content-type") || "application/octet-stream",
 		};
 		clear();
 		return out;
-	} catch {
+	} catch (err) {
 		clear();
-		return null;
+		return { ok: false, status: 0, error: errMsg(err) };
 	}
 }
 
@@ -703,6 +997,58 @@ export function listRowIsRich(m: RemoteModel): boolean {
 	const hasFlag =
 		caps.vision != null || caps.reasoning != null || caps.imageOutput != null || caps.tools != null;
 	return hasFlag && (hasName || hasKind);
+}
+
+/** True when the entry carries live server caps (slim caps, context, or output). */
+function hasLiveCaps(e: Pick<CatalogEntry, "capabilities" | "contextWindow" | "maxTokens">): boolean {
+	const c = e.capabilities;
+	if (Array.isArray(c) ? c.length > 0 : !!c && typeof c === "object" && Object.keys(c).length > 0) {
+		return true;
+	}
+	return (e.contextWindow ?? 0) > 0 || (e.maxTokens ?? 0) > 0;
+}
+
+/** Rich-row check over a catalog entry (adapts it to a list row for listRowIsRich). */
+function entryIsRich(e: CatalogEntry): boolean {
+	if ((e.contextWindow ?? 0) > 0 || (e.maxTokens ?? 0) > 0) return true;
+	if ((e.params?.length ?? 0) > 0) return true;
+	return listRowIsRich({
+		id: e.id,
+		name: e.name,
+		kind: e.detailKind ?? e.kind,
+		capabilities: e.capabilities,
+	});
+}
+
+/**
+ * Capability-aware auto default: when the user omits `model` and no default
+ * is set, prefer the first rich row (live caps via listRowIsRich) over a
+ * thin `{ id, owned_by }`-style entry. Falls back to the first entry when
+ * nothing is rich, undefined when the list is empty.
+ */
+export function pickAutoDefaultModel(models: CatalogEntry[]): CatalogEntry | undefined {
+	if (!models.length) return undefined;
+	return models.find(entryIsRich) ?? models[0];
+}
+
+export type CapsClass = "rich" | "thin" | "missing";
+
+/**
+ * Caps provenance class for browse filters + badges:
+ * rich = live server caps · thin = pattern fallback filled a thin live row ·
+ * missing = no caps at all (re-sync to confirm).
+ */
+export function capsClassOf(e: CatalogEntry): CapsClass {
+	if (e.capsFromPattern) return "thin";
+	return hasLiveCaps(e) ? "rich" : "missing";
+}
+
+/** Browse detail badge for caps provenance (single source — matches usage docs). */
+export function capsBadgeOf(e: CatalogEntry): string {
+	const c = capsClassOf(e);
+	if (c === "thin") return "caps source: pattern fallback (local estimate — live list/info had gaps)";
+	if (c === "rich") return "caps source: live server info";
+	return "caps source: missing (no live caps — run full sync)";
 }
 
 export function inferNameFromId(id: string): string {

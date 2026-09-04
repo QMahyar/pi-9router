@@ -7,3 +7,7 @@ node_modules/
 
 # Local machine notes for agents — setup is per-machine, not shared
 AGENTS.md
+
+# Local planning/tracker artifacts + pi session state — never shipped
+.wayfinder/
+.pi/

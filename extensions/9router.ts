@@ -28,17 +28,24 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import {
 	CONFIG_PATH,
 	DEFAULT_ENDPOINT,
+	INFO_CACHE_TTL,
+	INFO_MISSING_TTL,
 	TIMEOUT,
 	STALE_SYNC_MS,
 	type CatalogEntry,
+	type InfoCacheEntry,
 	type ModelCapabilities,
 	type RemoteModel,
 	asCaps,
 	authHeaders,
 	baseV1,
+	capsBadgeOf,
+	capsClassOf,
+	formatUsageSummary,
 	healthCheck,
 	httpGetJson,
 	inferNameFromId,
+	isInfoCacheFresh,
 	isSyncStale,
 	listRowIsRich,
 	loadJsonFile,
@@ -47,6 +54,9 @@ import {
 	normalizeEndpoint,
 	postBinary,
 	resolveApiKey,
+	sanitizeInfoCache,
+	sanitizeInfoMissing,
+	sanitizeModelNames,
 	saveJsonMerge,
 	paintFooterStatus,
 	footerFromConfig,
@@ -76,9 +86,89 @@ const FULL_CATALOG_KINDS = [
 /** Chat-only quick sync — skips tool catalogs and voice probes. */
 const QUICK_CATALOG_KINDS = ["chat"] as const;
 
+/** Diagnose list probes (ticket 5): chat first (sample id reuses this list),
+ *  then tool catalogs. Video has no list endpoint — a FAIL row with latency
+ *  is still informative, so it is probed last. */
+export const DIAGNOSE_PROBE_KINDS = [
+	"chat",
+	"image",
+	"tts",
+	"stt",
+	"embedding",
+	"web",
+	"image-to-text",
+	"video",
+] as const;
+
+/** Gated debug logging — off by default. Enable topics with
+ *  `NR_DEBUG=sync,timing` (comma-separated, case-insensitive). */
+export function isDebugTopic(topic: string): boolean {
+	const raw = process.env.NR_DEBUG ?? "";
+	return raw
+		.split(",")
+		.map((s) => s.trim().toLowerCase())
+		.filter(Boolean)
+		.includes(topic.toLowerCase());
+}
+
+export function debugLog(topic: "sync" | "timing", msg: string): void {
+	if (!isDebugTopic(topic)) return;
+	console.error(`[9router:${topic}] ${msg}`);
+}
+
+/** Triage status line (ticket 5): last-sync mode, per-kind counts, stale
+ *  flag, and missing-info (negative-cache) count. Shared by the Status TUI
+ *  and the diagnose output so both surfaces stay in sync. */
+export function formatTriageLine(input: {
+	lastSync?: string;
+	lastSyncMode?: string;
+	counts?: Partial<Record<string, number>>;
+	stale: boolean;
+	infoMissingCount: number;
+}): string {
+	const entries = Object.entries(input.counts ?? {}).filter(
+		(e): e is [string, number] => typeof e[1] === "number",
+	);
+	const countsStr = entries.length
+		? entries.map(([k, n]) => `${k}:${n}`).join("  ")
+		: "no counts";
+	return `Triage:   last sync ${input.lastSync ?? "never"}${input.lastSyncMode ? ` (${input.lastSyncMode})` : ""} · ${countsStr} · ${input.stale ? "stale" : "fresh"} · missing-info: ${input.infoMissingCount}`;
+}
+
+/**
+ * Honest info-probe breakdown for the sync report. Each label shows its own
+ * counter — no conflation:
+ * probed = info HTTP probes issued · hits = probed - misses ·
+ * misses = probes returning no record · cache hits = 7 d positive-cache
+ * reuse (no HTTP) · negative-skips = 24 h negative-cache skips (no HTTP) ·
+ * rich-skips = rows skipped as already rich (list row, synthetic, or
+ * preserved with metadata — the remainder of infoSkipped).
+ */
+export function formatInfoLine(input: {
+	infoFetched?: number;
+	infoMissed?: number;
+	infoCached?: number;
+	infoSkippedNegative?: number;
+	infoSkipped?: number;
+}): string {
+	const probed = input.infoFetched ?? 0;
+	const misses = input.infoMissed ?? 0;
+	const cached = input.infoCached ?? 0;
+	const negative = input.infoSkippedNegative ?? 0;
+	const skipped = input.infoSkipped ?? 0;
+	return `Info probed: ${probed} (hits ${probed - misses} · misses ${misses}) · cache hits (7d): ${cached} · negative-skips: ${negative} · rich-skips: ${skipped - cached - negative}`;
+}
+
 type CatalogKind = string;
 
 const INFO_CONCURRENCY = 8;
+
+/**
+ * Quick-sync stale threshold (ticket 3): preserved non-chat entries carried
+ * over unseen for this many consecutive syncs are flagged `stale` instead
+ * of looking freshly synced. A sync that lists the id again clears it.
+ */
+export const QUICK_STALE_AFTER_ABSENT = 2;
 
 /**
  * Voice-based TTS providers 9Router routes without credentials (noAuth).
@@ -130,6 +220,11 @@ interface PiModelDef {
 	contextWindow: number;
 	maxTokens: number;
 	compat?: Record<string, unknown>;
+	/** Caps provenance: true when context/vision/reasoning came from the
+	 *  local MODEL_PATTERN_CAPS fallback (not live server caps). Refresh
+	 *  re-runs pattern inference for capless rows with a pattern-derived
+	 *  hint instead of trusting the hint indefinitely. */
+	capsFromPattern?: boolean;
 }
 
 interface Config {
@@ -140,6 +235,12 @@ interface Config {
 	chatModels?: PiModelDef[];
 	catalog?: CatalogEntry[];
 	counts?: Partial<Record<string, number>>;
+	/** bare-id → timestamp — ids the server has no info record for (24 h TTL). */
+	infoMissing?: Record<string, number>;
+	/** `kind\0id` → { fetchedAt, info } — fetched info records (7 d TTL). */
+	infoCache?: Record<string, InfoCacheEntry>;
+	/** chat id → last-known friendly server name (full sync). Refresh reuses these for thin rows. */
+	modelNames?: Record<string, string>;
 }
 
 export type SyncMode = "quick" | "full";
@@ -158,18 +259,26 @@ function loadConfig(): Config {
 	const raw = loadJsonFile() as Partial<Config>;
 	if (!Object.keys(raw).length) return base;
 	return {
-		endpoint: normalizeEndpoint(raw.endpoint || base.endpoint),
-		apiKey: raw.apiKey ?? base.apiKey,
-		lastSync: raw.lastSync,
-		lastSyncMode: raw.lastSyncMode,
-		chatModels: raw.chatModels,
-		catalog: raw.catalog,
-		counts: raw.counts,
+		endpoint: normalizeEndpoint(
+			typeof raw.endpoint === "string" ? raw.endpoint : base.endpoint,
+		),
+		apiKey: typeof raw.apiKey === "string" ? raw.apiKey : base.apiKey,
+		lastSync: typeof raw.lastSync === "string" ? raw.lastSync : undefined,
+		lastSyncMode: raw.lastSyncMode === "quick" || raw.lastSyncMode === "full" ? raw.lastSyncMode : undefined,
+		chatModels: Array.isArray(raw.chatModels) ? raw.chatModels : undefined,
+		catalog: Array.isArray(raw.catalog) ? raw.catalog : undefined,
+		counts:
+			raw.counts !== null && typeof raw.counts === "object" && !Array.isArray(raw.counts)
+				? (raw.counts as Config["counts"])
+				: undefined,
+		infoMissing: sanitizeInfoMissing(raw.infoMissing),
+		infoCache: sanitizeInfoCache(raw.infoCache),
+		modelNames: sanitizeModelNames(raw.modelNames),
 	};
 }
 
 function saveConfig(config: Config): void {
-	saveJsonMerge({
+		saveJsonMerge({
 		endpoint: normalizeEndpoint(config.endpoint),
 		apiKey: config.apiKey,
 		lastSync: config.lastSync,
@@ -177,6 +286,9 @@ function saveConfig(config: Config): void {
 		chatModels: config.chatModels,
 		catalog: config.catalog,
 		counts: config.counts,
+		infoMissing: config.infoMissing,
+		infoCache: config.infoCache,
+		modelNames: config.modelNames,
 	});
 }
 
@@ -283,21 +395,48 @@ export function globMatch(pattern: string, s: string): boolean {
  * thinkingFormat) from MODEL_PATTERN_CAPS. Matches the leaf model id first
  * (same as the server's getCapabilitiesForModel baseModel), then the full id.
  * Explicit server fields are never overwritten.
+ *
+ * `onHit` fires with the matched pattern exactly when at least one field is
+ * filled — enrich counts these hits (NR_DEBUG=sync + sync report) so table
+ * drift (server lists going thin, new models missing from the table) stays
+ * detectable. Pure otherwise: no callback means no side effects.
  */
-export function fillModelCaps(id: string, caps: ModelCapabilities): ModelCapabilities {	const leaf = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
+export function fillModelCaps(
+	id: string,
+	caps: ModelCapabilities,
+	onHit?: (pattern: string) => void,
+): ModelCapabilities {
+	const leaf = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
 	const row = MODEL_PATTERN_CAPS.find(
 		(r) => globMatch(r.pattern, leaf) || globMatch(r.pattern, id),
 	);
 	if (!row) return caps;
 	const out = { ...caps };
-	if (typeof out.contextWindow !== "number" || out.contextWindow <= 0)
+	let hit = false;
+	// A hit counts only when the row actually supplies the missing field —
+	// every current table row carries contextWindow/maxOutput, but the guard
+	// keeps the counter honest if a future row is partial.
+	if ((typeof out.contextWindow !== "number" || out.contextWindow <= 0) && row.caps.contextWindow != null) {
 		out.contextWindow = row.caps.contextWindow;
-	if (typeof out.maxOutput !== "number" || out.maxOutput <= 0)
+		hit = true;
+	}
+	if ((typeof out.maxOutput !== "number" || out.maxOutput <= 0) && row.caps.maxOutput != null) {
 		out.maxOutput = row.caps.maxOutput;
-	if (out.vision === undefined) out.vision = row.caps.vision;
-	if (out.reasoning === undefined) out.reasoning = row.caps.reasoning;
-	if (out.thinkingFormat === undefined && out.reasoning === true)
+		hit = true;
+	}
+	if (out.vision === undefined && row.caps.vision !== undefined) {
+		out.vision = row.caps.vision;
+		hit = true;
+	}
+	if (out.reasoning === undefined && row.caps.reasoning !== undefined) {
+		out.reasoning = row.caps.reasoning;
+		hit = true;
+	}
+	if (out.thinkingFormat === undefined && out.reasoning === true && row.caps.thinkingFormat !== undefined) {
 		out.thinkingFormat = row.caps.thinkingFormat;
+		hit = true;
+	}
+	if (hit) onHit?.(row.pattern);
 	return out;
 }
 
@@ -391,10 +530,17 @@ export function mapThinkingCompat(caps?: ModelCapabilities): {
 
 function toPiModel(m: RemoteModel, info?: RemoteModel): PiModelDef {
 	// List-row caps win over info-record caps (chat info records are often thin).
-	const caps = fillModelCaps(m.id, {
-		...(asCaps(info?.capabilities) || {}),
-		...(asCaps(m.capabilities) || {}),
-	});
+	let patternHit = false;
+	const caps = fillModelCaps(
+		m.id,
+		{
+			...(asCaps(info?.capabilities) || {}),
+			...(asCaps(m.capabilities) || {}),
+		},
+		() => {
+			patternHit = true;
+		},
+	);
 	const id = m.id;
 	const reasoning = caps.reasoning ?? looksReasoning(id, caps);
 	const vision = caps.vision === true;
@@ -418,7 +564,97 @@ function toPiModel(m: RemoteModel, info?: RemoteModel): PiModelDef {
 		maxTokens,
 	};
 	if (compat) def.compat = compat;
+	if (patternHit) def.capsFromPattern = true;
 	return def;
+}
+
+/**
+ * Merge last-known friendly chat names (ticket 2).
+ * Chat-kind only — image/chat twins sharing a bare id never collide.
+ * Carries `prev` forward for ids still present (transient info misses keep
+ * their friendly name) and drops ids no longer listed. Server-named catalog
+ * entries (`namedByServer`) overwrite stale cached names.
+ */
+export function buildModelNames(
+	catalog: CatalogEntry[],
+	prev?: Record<string, string>,
+	presentIds?: Iterable<string>,
+): Record<string, string> {
+	const next: Record<string, string> = {};
+	const present = presentIds ? new Set(presentIds) : undefined;
+	if (prev) {
+		for (const [id, name] of Object.entries(prev)) {
+			if (typeof name !== "string" || !name.trim()) continue;
+			if (present && !present.has(id)) continue;
+			next[id] = name.trim();
+		}
+	}
+	for (const e of catalog) {
+		if (e.kind !== "chat") continue;
+		if (present && !present.has(e.id)) continue;
+		if (e.namedByServer && typeof e.name === "string" && e.name.trim()) {
+			next[e.id] = e.name.trim();
+		}
+	}
+	return next;
+}
+
+/**
+ * Prune last-known friendly names to the ids a listing actually returned.
+ * Refresh (and full sync) drop removed ids from the in-memory map AND the
+ * persisted patch, so a deleted server model stops shadowing a future
+ * same-id listing with a stale friendly name. Live names merge after.
+ */
+export function pruneModelNamesToListed(
+	cached: Map<string, string>,
+	listedIds: Iterable<string>,
+): void {
+	const listed = listedIds instanceof Set ? listedIds : new Set(listedIds);
+	for (const id of [...cached.keys()]) {
+		if (!listed.has(id)) cached.delete(id);
+	}
+}
+
+/**
+ * Thin-row-safe wrapper over toPiModel (ticket 2): live names always win
+ * (`info.name`, then list-row `m.name`); the cached friendly name is only a
+ * fallback for thin rows so `pi update --models` refreshes keep display
+ * names without an info fetch. Caps still merge from live rows/info.
+ *
+ * CORE BATCH (d): when `opts.hintFromPattern` is set (the caps-only hint was
+ * itself pattern-derived) and the live list row is capless, the hint is
+ * ignored for caps so pattern inference re-runs instead of trusting stale
+ * numbers indefinitely. The cached friendly name is still kept. When the
+ * pattern table has no match, the hint is used as before (unknown models
+ * keep their last-known numbers).
+ */
+export function toPiModelWithCachedName(
+	m: RemoteModel,
+	cachedName?: string,
+	info?: RemoteModel,
+	opts?: { hintFromPattern?: boolean },
+): PiModelDef {
+	if (info?.name?.trim()) return toPiModel(m, info);
+	if (m.name?.trim()) return toPiModel(m, info);
+	const cached = cachedName?.trim();
+	if (opts?.hintFromPattern && !info?.name?.trim()) {
+		const liveCaps = asCaps(m.capabilities);
+		const liveCapless = !liveCaps || Object.keys(liveCaps).length === 0;
+		if (liveCapless) {
+			let patternWouldFill = false;
+			fillModelCaps(m.id, {}, () => {
+				patternWouldFill = true;
+			});
+			if (patternWouldFill) {
+				return toPiModel(m, cached ? { id: m.id, name: cached } : undefined);
+			}
+		}
+	}
+	if (cached) {
+		const hint: RemoteModel = info ? { ...info, name: cached } : { id: m.id, name: cached };
+		return toPiModel(m, hint);
+	}
+	return toPiModel(m, info);
 }
 
 /** Keep only fields tools/browse need — shrinks ~/.pi/agent/9router.json. */
@@ -468,15 +704,18 @@ async function fetchModelInfo(
 	apiKey: string,
 	id: string,
 	signal?: AbortSignal,
-): Promise<RemoteModel | null> {
+): Promise<{ info: RemoteModel | null; status: number }> {
 	const url = `${baseV1(endpoint)}/models/info?id=${encodeURIComponent(id)}`;
 	const res = await httpGetJson<RemoteModel>(url, apiKey, {
 		signal,
 		timeoutMs: TIMEOUT.info,
 	});
-	if (!res.ok) return null;
-	if (!res.data || typeof res.data !== "object" || (res.data as any).error) return null;
-	return res.data;
+	// Propagate the HTTP status so callers negative-cache only true-404s.
+	// Transient 500s, timeouts, and 12 s aborts surface as status !== 404
+	// (status 0 for network/abort) and must be retried, never skipped for 24 h.
+	if (!res.ok) return { info: null, status: res.status };
+	if (!res.data || typeof res.data !== "object" || (res.data as any).error) return { info: null, status: 200 };
+	return { info: res.data, status: 200 };
 }
 
 /** Merge fresh caps into a catalog entry (list-row and info paths share this). */
@@ -492,29 +731,128 @@ function applyCapsToEntry(entry: CatalogEntry, caps: ModelCapabilities): void {
 }
 
 /**
+ * Look up info for (kind, id) — kind-qualified key first, bare-id fallback
+ * only when the bare id is unambiguous (appears under exactly one kind).
+ *
+ * Twin-risk note: the same bare id can appear in different catalog kinds
+ * (e.g. an image model and a chat model sharing the id `provider/name`).
+ * Keying infoById by `kind\0id` prevents cross-kind twin collisions — a
+ * chat twin can never donate the wrong kind's info name to an image entry.
+ * The bare-id fallback is safe only when no second kind has the same id in
+ * the info map.
+ */
+function lookupInfo(
+	infoById: Map<string, RemoteModel>,
+	kind: string,
+	id: string,
+): RemoteModel | undefined {
+	const kindKey = catalogKey(kind, id);
+	if (infoById.has(kindKey)) return infoById.get(kindKey);
+	// Bare-id fallback: only when exactly one kind stored this id
+	let found: RemoteModel | undefined;
+	let count = 0;
+	for (const [key, val] of infoById) {
+		if (key.endsWith(`\0${id}`)) {
+			found = val;
+			count++;
+			if (count > 1) break;
+		}
+	}
+	return count === 1 ? found : undefined;
+}
+
+/**
+ * Negative-cache predicate — true when `id` missed its info probe within the
+ * TTL and should be skipped without re-probing. Single source of truth for
+ * the infoMissing check (used by enrichCatalog, locked by regression tests).
+ */
+function isInfoMissingCached(
+	infoMissing: Record<string, number> | undefined,
+	id: string,
+	now: number = Date.now(),
+): boolean {
+	const cached = infoMissing?.[id];
+	return typeof cached === "number" && now - cached < INFO_MISSING_TTL;
+}
+
+/**
  * Enrich thin catalog rows via /v1/models/info.
  * Rows that already look rich (name + caps from list) are skipped.
+ *
+ * infoById is keyed by `kind\0id` so cross-kind twins never collide.
+ * infoCache (positive, 7 d TTL) is keyed by `kind\0id` for the same reason.
+ * infoMissing is a negative cache (bare-id → timestamp, 24 h TTL) for
+ * true-404 ids only, so quick-sync rebuilds (and full sync) skip
+ * re-probing known-missing ids while transient 500/timeout/abort failures
+ * are retried on the next sync.
  */
 async function enrichCatalog(
 	endpoint: string,
 	apiKey: string,
 	catalog: CatalogEntry[],
 	remotesByKey: Map<string, RemoteModel>,
-	opts: { signal?: AbortSignal; onProgress?: (msg: string) => void } = {},
+	opts: {
+		signal?: AbortSignal;
+		onProgress?: (msg: string) => void;
+		infoMissing?: Record<string, number>;
+		infoCache?: Record<string, InfoCacheEntry>;
+	} = {},
 ): Promise<{
 	named: number;
 	missing: number;
 	skipped: number;
 	fetched: number;
+	cachedInfo: number;
+	skippedNegative: number;
+	patternHits: number;
+	aborted: boolean;
 	infoById: Map<string, RemoteModel>;
+	infoMissing: Record<string, number>;
+	infoCache: Record<string, InfoCacheEntry>;
 }> {
 	const infoById = new Map<string, RemoteModel>();
+	const now = Date.now();
+	// Seed from the persisted caches through boundary validation: string/array
+	// blobs become empty maps, NaN/null/string timestamps and { info: null }
+	// records are dropped so malformed state never crashes or resurrects.
+	// Expired ids are re-probed so the config blob stays bounded.
+	const infoMissing: Record<string, number> = sanitizeInfoMissing(opts.infoMissing, now) ?? {};
+	const infoCache: Record<string, InfoCacheEntry> = sanitizeInfoCache(opts.infoCache, now) ?? {};
 	let named = 0;
 	let missing = 0;
 	let skipped = 0;
 	let fetched = 0;
+	let cachedInfo = 0;
+	let skippedNegative = 0;
+	// MODEL_PATTERN_CAPS fallback hits inside enrich (rich-row + info paths).
+	// Added to the list-build hits for the sync-report total.
+	let patternHits = 0;
+	const countPatternHit = (_pattern: string): void => {
+		patternHits++;
+	};
+
+	/** Apply a live (fresh or 7 d-cached) info record to its catalog entry. */
+	function applyInfoToEntry(entry: CatalogEntry, info: RemoteModel): void {
+		if (info.name?.trim()) {
+			entry.name = info.name.trim();
+			entry.namedByServer = true;
+			named++;
+		}
+		if (info.kind?.trim()) entry.detailKind = info.kind.trim();
+		if (info.endpoint?.trim()) entry.endpoint = info.endpoint.trim();
+		if (Array.isArray(info.params) && info.params.length) entry.params = info.params;
+		const caps = fillModelCaps(entry.id, asCaps(info.capabilities) || {}, (pattern) => {
+			entry.capsFromPattern = true;
+			countPatternHit(pattern);
+		});
+		if (Object.keys(caps).length) applyCapsToEntry(entry, caps);
+	}
 
 	const needInfo: CatalogEntry[] = [];
+	// Twins sharing a bare id (chat + image) share one /v1/models/info record:
+	// only the first thin twin queues a probe; the result fans out to every
+	// twin in the group. Kind-qualified reads (catalogKey) stay intact.
+	const probeGroups = new Map<string, CatalogEntry[]>();
 	for (const entry of catalog) {
 		if (entry.synthetic) {
 			skipped++;
@@ -528,20 +866,61 @@ async function enrichCatalog(
 		}
 		const remote = remotesByKey.get(`${entry.kind}\0${entry.id}`);
 		if (remote && listRowIsRich(remote)) {
-			// Already rich from list — seed info map for chat mapping
-			infoById.set(entry.id, remote);
+			// Already rich from list — seed info map keyed by (kind, id) to
+			// prevent cross-kind twin collisions.
+			infoById.set(catalogKey(entry.kind, entry.id), remote);
 			if (remote.name?.trim()) {
 				entry.name = remote.name.trim();
 				entry.namedByServer = true;
 				named++;
 			}
-			const caps = fillModelCaps(entry.id, asCaps(remote.capabilities) || {});
+			const caps = fillModelCaps(entry.id, asCaps(remote.capabilities) || {}, (pattern) => {
+				entry.capsFromPattern = true;
+				countPatternHit(pattern);
+			});
 			if (Object.keys(caps).length) applyCapsToEntry(entry, caps);
 			if (remote.kind?.trim()) entry.detailKind = remote.kind.trim();
 			if (Array.isArray(remote.params) && remote.params.length) entry.params = remote.params;
 			skipped++;
 			continue;
 		}
+		// 7 d positive-cache hit — reuse the fetched record, no HTTP.
+		// Keyed by (kind, id): a record fetched for one kind is never reused
+		// by another kind's twin, even within the TTL. Validated shape only
+		// (plain-record info with a string id); anything malformed
+		// ({ info: null }, arrays, NaN timestamps) was already dropped at
+		// seed and falls through to a live re-probe.
+		const cached = infoCache[catalogKey(entry.kind, entry.id)];
+		const cachedInfoRecord: unknown = cached?.info;
+		const cachedUsable =
+			cached !== undefined &&
+			isInfoCacheFresh(cached, now) &&
+			typeof cached === "object" &&
+			cached !== null &&
+			!Array.isArray(cached) &&
+			typeof cachedInfoRecord === "object" &&
+			cachedInfoRecord !== null &&
+			!Array.isArray(cachedInfoRecord) &&
+			typeof (cachedInfoRecord as { id?: unknown }).id === "string";
+		if (cachedUsable) {
+			infoById.set(catalogKey(entry.kind, entry.id), cached.info);
+			applyInfoToEntry(entry, cached.info);
+			cachedInfo++;
+			skipped++;
+			continue;
+		}
+		// Skip ids whose last info probe already returned null (negative cache).
+		if (isInfoMissingCached(infoMissing, entry.id, now)) {
+			skipped++;
+			skippedNegative++;
+			continue;
+		}
+		const group = probeGroups.get(entry.id);
+		if (group) {
+			group.push(entry);
+			continue;
+		}
+		probeGroups.set(entry.id, [entry]);
 		needInfo.push(entry);
 	}
 
@@ -549,12 +928,21 @@ async function enrichCatalog(
 		`Fetching metadata for ${needInfo.length} models (${skipped} already rich)…`,
 	);
 
+	const total = needInfo.length;
+	// Stream progress — ~10 updates per enrich so long syncs stay alive.
+	// The step scales with the total (min would cap the step, not the count).
+	let done = 0;
+	const step = Math.max(1, Math.ceil(total / 10));
 	const results = await mapConcurrent(
 		needInfo,
 		INFO_CONCURRENCY,
 		async (entry) => {
-			const info = await fetchModelInfo(endpoint, apiKey, entry.id, opts.signal);
-			return { entry, info };
+			const { info, status } = await fetchModelInfo(endpoint, apiKey, entry.id, opts.signal);
+			done++;
+			if (done % step === 0 || done === total) {
+				opts.onProgress?.(`Metadata ${done}/${total}…`);
+			}
+			return { entry, info, status };
 		},
 		opts.signal,
 	);
@@ -562,25 +950,52 @@ async function enrichCatalog(
 	for (const r of results) {
 		if (!r) continue;
 		fetched++;
-		const { entry, info } = r;
+		const { entry, info, status } = r;
 		if (!info) {
 			missing++;
+			// Negative-cache only true-404s so quick-sync (and full sync)
+			// skips re-probing ids the server has no record for. Transient
+			// 500s, timeouts, and aborts (status !== 404) are NOT cached —
+			// the next sync re-probes them.
+			if (status === 404) infoMissing[entry.id] = now;
 			continue;
 		}
-		infoById.set(entry.id, info);
-		if (info.name?.trim()) {
-			entry.name = info.name.trim();
-			entry.namedByServer = true;
-			named++;
+		// Fan out to every twin in the probe group; each twin keeps its own
+		// kind-qualified key so cross-kind twins never collide on read.
+		const twins = probeGroups.get(entry.id) ?? [entry];
+		for (const twin of twins) {
+			// Key by (kind, id) — prevents cross-kind twin collisions.
+			infoById.set(catalogKey(twin.kind, twin.id), info);
+			// Persist the raw record for 7 d reuse (pattern fill re-runs per sync).
+			infoCache[catalogKey(twin.kind, twin.id)] = { fetchedAt: now, info };
+			applyInfoToEntry(twin, info);
 		}
-		if (info.kind?.trim()) entry.detailKind = info.kind.trim();
-		if (info.endpoint?.trim()) entry.endpoint = info.endpoint.trim();
-		if (Array.isArray(info.params) && info.params.length) entry.params = info.params;
-		const caps = fillModelCaps(entry.id, asCaps(info.capabilities) || {});
-		if (Object.keys(caps).length) applyCapsToEntry(entry, caps);
 	}
 
-	return { named, missing, skipped, fetched, infoById };
+	debugLog(
+		"sync",
+		`enrich classify named=${named} fetched=${fetched} cached=${cachedInfo} skipped=${skipped} missing=${missing} skip-negative=${skippedNegative} needInfo=${needInfo.length}`,
+	);
+	debugLog(
+		"sync",
+		`info hit=${fetched - missing} miss=${missing} skip-negative=${skippedNegative} pattern-hits=${patternHits}`,
+	);
+	const aborted = opts.signal?.aborted ?? false;
+	if (aborted) debugLog("sync", "enrich aborted — partial results discarded by caller");
+
+	return {
+		named,
+		missing,
+		skipped,
+		fetched,
+		cachedInfo,
+		skippedNegative,
+		patternHits,
+		aborted,
+		infoById,
+		infoMissing,
+		infoCache,
+	};
 }
 
 // ── Voice TTS ───────────────────────────────────────────────────
@@ -690,13 +1105,66 @@ export interface SyncResult {
 	namesDerived?: number;
 	infoFetched?: number;
 	infoSkipped?: number;
+	/** 7 d positive-cache hits (no HTTP) — unified with the 24 h negative cache. */
+	infoCached?: number;
+	/** Info probes that returned no record (404s + transient). Positive hits = infoFetched - infoMissed. */
+	infoMissed?: number;
+	/** 24 h negative-cache skips (no HTTP) — included in infoSkipped. */
+	infoSkippedNegative?: number;
+	/** MODEL_PATTERN_CAPS fallback fills (list build + enrich). A rising
+	 *  count across syncs signals table drift — thin server lists or new
+	 *  models missing from the table. See NR_DEBUG=sync logs. */
+	patternHits?: number;
 	voiceSkipped?: string[];
 	voiceAdded?: number;
+	infoMissing?: Record<string, number>;
+	infoCache?: Record<string, InfoCacheEntry>;
+	modelNames?: Record<string, string>;
 	timings?: Record<string, number>;
 }
 
 function catalogKey(kind: string, id: string): string {
 	return `${kind}\0${id}`;
+}
+
+/**
+ * Quick-sync aging (ticket 3): mark preserved entries stale after N absent
+ * syncs instead of keeping them fresh forever — with no re-probe, so quick
+ * sync stays a chat-only fetch.
+ *
+ * `prev` entries whose (kind, id) is NOT in `confirmed` (the ids this sync
+ * actually listed) get `absentSyncs` bumped and `stale: true` once the count
+ * reaches `maxAbsent`. Entries this sync DID confirm come back clean
+ * (`absentSyncs`/`stale` cleared). Synthetic voice entries are exempt — they
+ * are generated locally, have no server list to be absent from, and full
+ * sync re-probes them anyway.
+ *
+ * Counts live on the CatalogEntry itself, so they persist through the
+ * existing catalog save path (`saveConfig` → `saveJsonMerge`) with no new
+ * top-level config keys and no extra merge logic. Full sync rebuilds the
+ * catalog from fresh lists, which naturally clears reappearing entries and
+ * prunes truly-deleted ones.
+ */
+export function ageAbsentEntries(
+	prev: CatalogEntry[],
+	confirmed: Set<string> | Iterable<string>,
+	maxAbsent: number = QUICK_STALE_AFTER_ABSENT,
+): CatalogEntry[] {
+	const seen = confirmed instanceof Set ? confirmed : new Set(confirmed);
+	return prev.map((e) => {
+		if (e.synthetic) return e;
+		if (seen.has(catalogKey(e.kind, e.id))) {
+			if (e.absentSyncs == null && !e.stale) return e;
+			const next: CatalogEntry = { ...e };
+			delete next.absentSyncs;
+			delete next.stale;
+			return next;
+		}
+		const absent = (e.absentSyncs ?? 0) + 1;
+		const next: CatalogEntry = { ...e, absentSyncs: absent };
+		if (absent >= maxAbsent) next.stale = true;
+		return next;
+	});
 }
 
 export async function fetchAllAndBuild(
@@ -715,6 +1183,8 @@ export async function fetchAllAndBuild(
 	const catalog: CatalogEntry[] = [];
 	const chatModels: PiModelDef[] = [];
 	const remotesByKey = new Map<string, RemoteModel>();
+	// MODEL_PATTERN_CAPS fallback hits during list build; enrich adds its own.
+	let patternHits = 0;
 	const timings: Record<string, number> = {};
 	const tSync = Date.now();
 
@@ -738,9 +1208,13 @@ export async function fetchAllAndBuild(
 		mode === "quick" ? "Fetching chat models…" : "Fetching model catalogs…",
 	);
 	const tList = Date.now();
+	// Each kind reports as it lands (Promise.all still fetches concurrently).
 	const results = await Promise.all(
 		kinds.map(async (kind) => {
 			const r = await fetchKind(endpoint, apiKey, kind, opts.signal);
+			opts.onProgress?.(
+				r.ok ? `Listed ${kind}: ${r.models.length} models (${r.ms}ms)…` : `List ${kind} failed: ${r.error}`,
+			);
 			return { kind, r };
 		}),
 	);
@@ -751,6 +1225,7 @@ export async function fetchAllAndBuild(
 
 	for (const { kind, r } of results) {
 		timings[`list:${kind}`] = r.ms;
+		debugLog("timing", `list ${kind}: ${r.ms}ms ${r.ok ? `${r.models.length} models` : `FAIL ${r.error}`}`);
 		if (!r.ok) {
 			errors.push(r.error);
 			counts[kind] = 0;
@@ -765,7 +1240,11 @@ export async function fetchAllAndBuild(
 			if (remotesByKey.has(key)) continue;
 			remotesByKey.set(key, m);
 
-			const caps = fillModelCaps(m.id, asCaps(m.capabilities) || {});
+			let listPatternHit = false;
+			const caps = fillModelCaps(m.id, asCaps(m.capabilities) || {}, () => {
+				listPatternHit = true;
+			});
+			if (listPatternHit) patternHits++;
 			const namedByServer = Boolean(m.name?.trim());
 			catalog.push({
 				id: m.id,
@@ -777,6 +1256,7 @@ export async function fetchAllAndBuild(
 				capabilities: slimCaps(caps),
 				params: m.params,
 				namedByServer,
+				...(listPatternHit ? { capsFromPattern: true as const } : {}),
 				contextWindow: caps.contextWindow,
 				maxTokens: caps.maxOutput,
 				reasoning: caps.reasoning ?? looksReasoning(m.id, caps),
@@ -798,12 +1278,13 @@ export async function fetchAllAndBuild(
 		};
 	}
 
-	// Quick mode: keep previous non-chat catalog entries so tools still work
+	// Quick mode: keep previous non-chat catalog entries so tools still work.
+	// Unconfirmed entries age via absence counts — stale after N consecutive
+	// syncs unseen (ticket 3). No re-probe: quick sync stays chat-only fetch.
 	if (mode === "quick") {
-		const prev = loadConfig().catalog || [];
+		const prev = (loadConfig().catalog || []).filter((e) => e.kind !== "chat");
 		const seen = new Set(catalog.map((c) => catalogKey(c.kind, c.id)));
-		for (const e of prev) {
-			if (e.kind === "chat") continue;
+		for (const e of ageAbsentEntries(prev, seen)) {
 			const k = catalogKey(e.kind, e.id);
 			if (seen.has(k)) continue;
 			seen.add(k);
@@ -820,12 +1301,43 @@ export async function fetchAllAndBuild(
 	const enriched = await enrichCatalog(endpoint, apiKey, catalog, remotesByKey, {
 		signal: opts.signal,
 		onProgress: opts.onProgress,
+		infoMissing: config.infoMissing,
+		infoCache: config.infoCache,
 	});
 	timings.enrich = Date.now() - tInfo;
+	debugLog("timing", `enrich: ${timings.enrich}ms`);
+	// Abort during enrich must NOT save a partial sync as success. The enrich
+	// workers fail fast on abort (status 0, never negatively cached), so without
+	// this check the truncated catalog would return ok:true and the TUI would
+	// persist it with a fresh lastSync. Mark the sync failed instead — runSync
+	// leaves the config (and status/sync-summary) untouched on !ok.
+	if (opts.signal?.aborted || enriched.aborted) {
+		timings.total = Date.now() - tSync;
+		debugLog("timing", `sync aborted during enrich mode=${mode}`);
+		return {
+			ok: false,
+			mode,
+			error: "Sync aborted during metadata fetch — partial results discarded (config unchanged).",
+			counts,
+			chatModels: [],
+			catalog,
+			healthOk: true,
+			infoMissing: enriched.infoMissing,
+			infoCache: enriched.infoCache,
+			timings,
+		};
+	}
 	const infoById = enriched.infoById;
+	const infoMissing = enriched.infoMissing;
+	const infoCache = enriched.infoCache;
 	const namedByServer = enriched.named;
 	const infoFetched = enriched.fetched;
 	const infoSkipped = enriched.skipped;
+	const infoCached = enriched.cachedInfo;
+	const infoMissed = enriched.missing;
+	const infoSkippedNegative = enriched.skippedNegative;
+	patternHits += enriched.patternHits;
+	debugLog("sync", `pattern fallback hits=${patternHits} (list+enrich) of ${catalog.length} catalog rows`);
 
 	let voiceSkipped: string[] = [];
 	let voiceAdded = 0;
@@ -836,6 +1348,7 @@ export async function fetchAllAndBuild(
 			onProgress: opts.onProgress,
 		});
 		timings.voice = Date.now() - tVoice;
+		debugLog("timing", `voice: ${timings.voice}ms added=${voice.entries.length} skipped=${voice.skipped.length}`);
 		voiceSkipped = voice.skipped;
 		if (voice.entries.length) {
 			const known = new Set(catalog.map((c) => c.id));
@@ -850,9 +1363,17 @@ export async function fetchAllAndBuild(
 	const chatEntryById = new Map(
 		catalog.filter((c) => c.kind === "chat").map((c) => [c.id, c] as const),
 	);
+	// Last-known friendly names: thin list rows with no server name reuse the
+	// persisted modelNames cache instead of the bare id fallback. Live names
+	// (list row, then info record) still win inside toPiModelWithCachedName.
+	const cachedChatNames = config.modelNames;
 
 	for (const m of chatRemotes) {
-		const def = toPiModel(m, infoById.get(m.id));
+		const def = toPiModelWithCachedName(
+			m,
+			cachedChatNames?.[m.id],
+			lookupInfo(infoById, "chat", m.id),
+		);
 		chatModels.push(def);
 		const entry = chatEntryById.get(m.id);
 		if (entry) {
@@ -867,6 +1388,13 @@ export async function fetchAllAndBuild(
 	}
 
 	timings.total = Date.now() - tSync;
+	debugLog("timing", `sync total: ${timings.total}ms mode=${mode}`);
+
+	const modelNames = buildModelNames(
+		catalog,
+		config.modelNames,
+		chatRemotes.map((m) => m.id),
+	);
 
 	return {
 		ok: true,
@@ -880,8 +1408,15 @@ export async function fetchAllAndBuild(
 		namesDerived: catalog.filter((c) => !c.namedByServer && !c.synthetic).length,
 		infoFetched,
 		infoSkipped,
+		infoCached,
+		infoMissed,
+		infoSkippedNegative,
+		patternHits,
 		voiceSkipped,
 		voiceAdded,
+		infoMissing,
+		infoCache,
+		modelNames,
 		timings,
 	};
 }
@@ -895,6 +1430,9 @@ export interface DiagnoseResult {
 	sampleInfo?: { id: string; ok: boolean; ms: number; name?: string; error?: string };
 	voiceProbes: Array<{ provider: string; ok: boolean; ms?: number; error?: string }>;
 	lastSync?: string;
+	lastSyncMode?: string;
+	counts?: Partial<Record<string, number>>;
+	infoMissingCount?: number;
 	stale: boolean;
 }
 
@@ -910,37 +1448,41 @@ export async function diagnoseConnection(
 		kinds: [],
 		voiceProbes: [],
 		lastSync: config.lastSync,
+		lastSyncMode: config.lastSyncMode,
+		counts: config.counts ? { ...config.counts } : undefined,
+		infoMissingCount: Object.keys(config.infoMissing ?? {}).length,
 		stale: isSyncStale(config.lastSync),
 	};
 
 	opts.onProgress?.("Health…");
 	out.health = await healthCheck(endpoint, { signal: opts.signal });
+	debugLog("timing", `diagnose health: ${out.health.ms ?? 0}ms ${out.health.ok ? "OK" : `FAIL ${out.health.error ?? ""}`}`);
 
-	const probeKinds = ["chat", "image", "tts", "embedding", "web"] as const;
-	for (const kind of probeKinds) {
+	// Reuse the first chat list for the sample info id — no second fetch.
+	let chatSampleId: string | undefined;
+	for (const kind of DIAGNOSE_PROBE_KINDS) {
 		opts.onProgress?.(`List ${kind}…`);
 		const r = await fetchKind(endpoint, apiKey, kind, opts.signal);
-		if (r.ok) out.kinds.push({ kind, ok: true, count: r.models.length, ms: r.ms });
-		else out.kinds.push({ kind, ok: false, ms: r.ms, error: r.error });
+		debugLog("timing", `diagnose list ${kind}: ${r.ms}ms ${r.ok ? `${r.models.length} models` : `FAIL ${r.error}`}`);
+		if (r.ok) {
+			out.kinds.push({ kind, ok: true, count: r.models.length, ms: r.ms });
+			if (kind === "chat" && chatSampleId === undefined) chatSampleId = r.models[0]?.id;
+		} else out.kinds.push({ kind, ok: false, ms: r.ms, error: r.error });
 	}
 
-	const chatKind = out.kinds.find((k) => k.kind === "chat" && k.ok);
-	if (chatKind) {
-		// Sample first chat id from a quick list
-		const list = await fetchKind(endpoint, apiKey, "chat", opts.signal);
-		const sampleId = list.ok ? list.models[0]?.id : undefined;
-		if (sampleId) {
-			opts.onProgress?.(`Info ${sampleId}…`);
-			const t0 = Date.now();
-			const info = await fetchModelInfo(endpoint, apiKey, sampleId, opts.signal);
-			out.sampleInfo = {
-				id: sampleId,
-				ok: Boolean(info),
-				ms: Date.now() - t0,
-				name: info?.name,
-				error: info ? undefined : "no info record",
-			};
-		}
+	if (chatSampleId) {
+		opts.onProgress?.(`Info ${chatSampleId}…`);
+		const t0 = Date.now();
+		const { info } = await fetchModelInfo(endpoint, apiKey, chatSampleId, opts.signal);
+		const ms = Date.now() - t0;
+		debugLog("timing", `diagnose info ${chatSampleId}: ${ms}ms ${info ? "OK" : "miss"}`);
+		out.sampleInfo = {
+			id: chatSampleId,
+			ok: Boolean(info),
+			ms,
+			name: info?.name,
+			error: info ? undefined : "no info record",
+		};
 	}
 
 	for (const p of VOICE_TTS_PROVIDERS) {
@@ -951,6 +1493,7 @@ export async function diagnoseConnection(
 			`${p.provider}/${p.probe}`,
 			opts.signal,
 		);
+		debugLog("timing", `diagnose voice ${p.provider}: ${probe.ms ?? 0}ms ${probe.ok ? "OK" : `FAIL ${probe.error ?? ""}`}`);
 		out.voiceProbes.push({
 			provider: p.provider,
 			ok: probe.ok,
@@ -968,6 +1511,27 @@ function registerWithPi(pi: ExtensionAPI, config: Config, models: PiModelDef[]):
 	const endpoint = normalizeEndpoint(config.endpoint);
 	const apiKey = resolveApiKey(config.apiKey);
 	let chatModels = models;
+	// Last-known friendly chat names — explicit map first, then fall back to
+	// the registered models + chat catalog entries (pre-map configs).
+	// Chat-kind only so image/chat twins never donate the wrong kind's name.
+	const cachedNames = new Map<string, string>();
+	if (config.modelNames) {
+		for (const [id, name] of Object.entries(config.modelNames)) {
+			if (typeof name === "string" && name.trim()) cachedNames.set(id, name.trim());
+		}
+	}
+	for (const m of models) {
+		if (cachedNames.has(m.id)) continue;
+		if (typeof m.name === "string" && m.name.trim() && m.name.trim() !== inferNameFromId(m.id)) {
+			cachedNames.set(m.id, m.name.trim());
+		}
+	}
+	for (const c of config.catalog || []) {
+		if (c.kind !== "chat" || cachedNames.has(c.id)) continue;
+		if (c.namedByServer && typeof c.name === "string" && c.name.trim()) {
+			cachedNames.set(c.id, c.name.trim());
+		}
+	}
 
 	if (!chatModels.length) {
 		try {
@@ -995,19 +1559,51 @@ function registerWithPi(pi: ExtensionAPI, config: Config, models: PiModelDef[]):
 			...(m.compat ? { compat: m.compat } : {}),
 		})),
 		// Live discovery hook (docs/extensions.md): pi calls this during model
-		// refresh. Quick chat-only fetch — no enrich. Successful refreshes are
-		// persisted back to 9router.json (chatModels only; the durable catalog
-		// stays owned by the /9router sync flow) and become the new fallback,
-		// so a later failed refresh never wipes the provider.
+		// refresh. Quick chat-only fetch — no enrich. Thin refresh rows reuse
+		// the last-known friendly names persisted by full sync (modelNames +
+		// chatModels/catalog fallback) instead of the bare inferName fallback.
+		// Successful refreshes persist chatModels + modelNames and become the
+		// new fallback, so a later failed refresh never wipes the provider.
 		async refreshModels(context: { signal: AbortSignal; allowNetwork?: boolean }) {
 			if (context.allowNetwork === false) return chatModels;
-			const list = await fetchKind(endpoint, apiKey, "chat", context.signal);
-			if (list.ok && list.models.length) {
-				chatModels = list.models.map((m) => toPiModel(m));
-				saveJsonMerge({ chatModels });
+			try {
+				const list = await fetchKind(endpoint, apiKey, "chat", context.signal);
+				if (!list.ok || !list.models.length) return chatModels;
+				// Last-known per-kind (chat) info hints: exact caps from the
+				// registered defs beat pattern estimates for thin refresh rows. A capless live
+					// row with a pattern-derived hint re-runs pattern inference instead of
+					// trusting the hint indefinitely (provenance flag).
+				// Caps only (no name) — names stay on the cached-friendly path
+				// so a stale def name can never override them. Live list-row
+				// caps still win via the toPiModel merge order.
+				const prevCapsById = new Map(chatModels.map((d) => [d.id, d] as const));
+				const next = list.models.map((m) => {
+					const prev = prevCapsById.get(m.id);
+					const hint: RemoteModel | undefined = prev
+						? {
+								id: prev.id,
+								capabilities: {
+									contextWindow: prev.contextWindow,
+									maxOutput: prev.maxTokens,
+								},
+							}
+						: undefined;
+					return toPiModelWithCachedName(m, cachedNames.get(m.id), hint, {
+						hintFromPattern: prev?.capsFromPattern,
+					});
+				});
+				// Drop names for ids the server no longer lists before merging
+				// live names, so removed models prune out of the saved map.
+				pruneModelNamesToListed(cachedNames, list.models.map((m) => m.id));
+				for (const m of list.models) {
+					if (m.name?.trim()) cachedNames.set(m.id, m.name.trim());
+				}
+				chatModels = next;
+				saveJsonMerge({ chatModels, modelNames: Object.fromEntries(cachedNames) });
+				return chatModels;
+			} catch {
 				return chatModels;
 			}
-			return chatModels;
 		},
 	});
 }
@@ -1020,8 +1616,13 @@ function applySyncToConfig(config: Config, sync: SyncResult): Config {
 		chatModels: sync.chatModels,
 		catalog: sync.catalog,
 		counts: sync.counts,
+		infoMissing: sync.infoMissing,
+		infoCache: sync.infoCache,
+		modelNames: sync.modelNames,
 	};
+	const tSave = Date.now();
 	saveConfig(next);
+	debugLog("timing", `save: ${Date.now() - tSave}ms`);
 	return next;
 }
 
@@ -1034,7 +1635,7 @@ function describeKey(apiKey?: string, notSetText = "(not set — ok if 9Router a
 	return notSetText;
 }
 
-function statusLines(config: Config): string[] {
+export function statusLines(config: Config): string[] {
 	const counts = config.counts || {};
 	const chat = config.chatModels?.length ?? counts.chat ?? 0;
 	const stale = isSyncStale(config.lastSync);
@@ -1043,6 +1644,13 @@ function statusLines(config: Config): string[] {
 		`Endpoint:  ${config.endpoint}`,
 		`API key:   ${describeKey(config.apiKey)}`,
 		`Last sync: ${config.lastSync || "never"}${config.lastSyncMode ? ` (${config.lastSyncMode})` : ""}${stale ? "  ⚠ stale (>24h)" : ""}`,
+		formatTriageLine({
+			lastSync: config.lastSync,
+			lastSyncMode: config.lastSyncMode,
+			counts,
+			stale,
+			infoMissingCount: Object.keys(config.infoMissing ?? {}).length,
+		}),
 		`Chat registered: ${chat}`,
 		`Footer:    ${footerOn ? "on" : "off"}`,
 	];
@@ -1050,6 +1658,10 @@ function statusLines(config: Config): string[] {
 		.map((k) => (counts[k] ? `${k}:${counts[k]}` : null))
 		.filter(Boolean);
 	if (extras.length) lines.push(`Catalog:   ${extras.join("  ")}`);
+	const usage = formatUsageSummary();
+	if (usage) lines.push(usage);
+	const staleN = (config.catalog || []).filter((e) => e.stale).length;
+	if (staleN) lines.push(`Stale:     ${staleN} unconfirmed (quick sync) — run full sync to confirm`);
 	lines.push(`Config:    ${CONFIG_PATH}`);
 	return lines;
 }
@@ -1073,7 +1685,29 @@ async function browseCatalog(ui: ExtensionContext["ui"], config: Config): Promis
 		if (!kindChoice || kindChoice === "← Back") return;
 
 		const kind = kindChoice.replace(/\s*\(\d+\)$/, "");
-		const entries = catalog.filter((e) => e.kind === kind).sort((a, b) => a.id.localeCompare(b.id));
+		const kindEntries = catalog.filter((e) => e.kind === kind).sort((a, b) => a.id.localeCompare(b.id));
+
+		// Caps filter: rich (live server caps) / thin (pattern fallback) / missing.
+		const nRich = kindEntries.filter((e) => capsClassOf(e) === "rich").length;
+		const nThin = kindEntries.filter((e) => capsClassOf(e) === "thin").length;
+		const nMissing = kindEntries.filter((e) => capsClassOf(e) === "missing").length;
+		const filterChoice = await ui.select(`${kind} — filter`, [
+			`All (${kindEntries.length})`,
+			`Rich — live caps (${nRich})`,
+			`Thin — pattern fallback (${nThin})`,
+			`Missing caps (${nMissing})`,
+			"← Back",
+		]);
+		if (!filterChoice || filterChoice === "← Back") continue;
+		const cls = filterChoice.startsWith("Rich")
+			? ("rich" as const)
+			: filterChoice.startsWith("Thin")
+				? ("thin" as const)
+				: filterChoice.startsWith("Missing")
+					? ("missing" as const)
+					: undefined;
+		const entries = cls ? kindEntries.filter((e) => capsClassOf(e) === cls) : kindEntries;
+		const filterLabel = cls ?? "all";
 
 		const pageSize = 30;
 		let page = 0;
@@ -1087,6 +1721,9 @@ async function browseCatalog(ui: ExtensionContext["ui"], config: Config): Promis
 				if (e.input?.includes("image")) bits.push("👁");
 				if (e.contextWindow) bits.push(`${Math.round(e.contextWindow / 1000)}k`);
 				if (e.registered) bits.push("✓ pi");
+				if (e.stale) bits.push("⚠ stale");
+				if (e.capsFromPattern) bits.push("◐ pattern");
+				else if (capsClassOf(e) === "missing") bits.push("○ no caps");
 				if (e.params?.length) bits.push(`[${e.params.slice(0, 3).join(",")}]`);
 				return bits.join(" · ");
 			});
@@ -1095,7 +1732,7 @@ async function browseCatalog(ui: ExtensionContext["ui"], config: Config): Promis
 			items.push("← Back");
 
 			const pick = await ui.select(
-				`${kind} · ${entries.length} models · page ${page + 1}/${totalPages}`,
+				`${kind} · ${filterLabel} · ${entries.length} models · page ${page + 1}/${totalPages}`,
 				items,
 			);
 			if (!pick || pick === "← Back") break;
@@ -1116,6 +1753,7 @@ async function browseCatalog(ui: ExtensionContext["ui"], config: Config): Promis
 				`id: ${entry.id}`,
 				`name: ${entry.name}${entry.namedByServer ? "" : " (derived from id — server has no name)"}`,
 				`kind: ${entry.kind}${entry.detailKind && entry.detailKind !== entry.kind ? ` (server: ${entry.detailKind})` : ""}`,
+				capsBadgeOf(entry),
 				entry.synthetic ? `source: added locally${entry.note ? ` — ${entry.note}` : ""}` : "",
 				entry.ownedBy ? `owned_by: ${entry.ownedBy}` : "",
 				entry.endpoint ? `endpoint: ${entry.endpoint}` : "",
@@ -1124,6 +1762,9 @@ async function browseCatalog(ui: ExtensionContext["ui"], config: Config): Promis
 				entry.reasoning != null ? `reasoning: ${entry.reasoning}` : "",
 				entry.input ? `input: ${entry.input.join(", ")}` : "",
 				entry.registered ? "registered in pi: yes" : "registered in pi: no (non-chat or not synced)",
+				entry.stale
+					? `stale: unconfirmed for ${entry.absentSyncs ?? "?"} sync(s) — run full sync to confirm or prune`
+					: "",
 				entry.params?.length ? `params: ${entry.params.join(", ")}` : "",
 				entry.capabilities
 					? `capabilities: ${typeof entry.capabilities === "string" ? entry.capabilities : JSON.stringify(entry.capabilities)}`
@@ -1137,11 +1778,18 @@ async function browseCatalog(ui: ExtensionContext["ui"], config: Config): Promis
 	}
 }
 
-function formatDiagnose(d: DiagnoseResult): string {
+export function formatDiagnose(d: DiagnoseResult): string {
 	const lines = [
 		`Endpoint  ${d.endpoint}`,
 		`Health    ${d.health.ok ? "OK" : "FAIL"} ${d.health.ms != null ? `${d.health.ms}ms` : ""}${d.health.error ? ` — ${d.health.error}` : ""}`,
 		`Last sync ${d.lastSync || "never"}${d.stale ? "  ⚠ stale (>24h)" : ""}`,
+		formatTriageLine({
+			lastSync: d.lastSync,
+			lastSyncMode: d.lastSyncMode,
+			counts: d.counts,
+			stale: d.stale,
+			infoMissingCount: d.infoMissingCount ?? 0,
+		}),
 		"",
 		"List latency:",
 		...d.kinds.map((k) =>
@@ -1200,9 +1848,13 @@ async function runSync(
 		...Object.entries(sync.counts).map(([k, n]) => `  ${k}: ${n}`),
 		"",
 		`Names from server: ${sync.namedByServer ?? 0} · derived: ${sync.namesDerived ?? 0}`,
-		`Info fetched: ${sync.infoFetched ?? 0} · skipped (already rich): ${sync.infoSkipped ?? 0}`,
+		formatInfoLine(sync),
+		`Pattern fallback: ${sync.patternHits ?? 0} of ${sync.catalog.length} rows (rising counts signal table drift — see NR_DEBUG=sync)`,
 		sync.voiceAdded ? `Voice TTS added: ${sync.voiceAdded}` : "",
 		sync.voiceSkipped?.length ? `Voice TTS unavailable: ${sync.voiceSkipped.join(", ")}` : "",
+		sync.catalog.some((c) => c.stale)
+			? `Stale: ${sync.catalog.filter((c) => c.stale).length} unconfirmed (quick sync) — run full sync to confirm`
+			: "",
 		totalMs != null ? `Total: ${totalMs}ms` : "",
 		sync.error ? `Note: ${sync.error}` : "",
 		"",
@@ -1408,4 +2060,4 @@ export default function (pi: ExtensionAPI) {
 }
 
 // re-export for tests
-export { isSyncStale, STALE_SYNC_MS, withTimeout, authHeaders };
+export { isSyncStale, STALE_SYNC_MS, withTimeout, authHeaders, lookupInfo, catalogKey, INFO_MISSING_TTL, INFO_CACHE_TTL, isInfoMissingCached, enrichCatalog };

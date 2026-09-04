@@ -29,9 +29,90 @@ Do **not** put machine-only paths or secrets here — those stay in gitignored `
 
 ## [Unreleased]
 
+### Added (Wayfinder 10x effort — local tracker, not shipped)
+
+- Ticket 01: kind-qualified info cache (`catalogKey`/`lookupInfo` — `kind\0id`
+  keys, twin-safe) + 24h negative cache (`infoMissing`, `isInfoMissingCached`)
+  so quick-sync rebuilds skip re-probing known-missing ids.
+- Ticket 02: `refreshModels` keeps friendly names (`buildModelNames` persists
+  last-known chat names, `toPiModelWithCachedName` reuses them for thin rows,
+  live names/caps always win, failed/empty refresh never wipes the provider).
+- Ticket 03: quick-sync stale marking (`ageAbsentEntries`,
+  `QUICK_STALE_AFTER_ABSENT=2`, synthetic voice entries exempt, survives the
+  catalog save path; full sync rebuild clears/prunes).
+- Ticket 04: `nr_video_generate` via shared `resolveModel` against synced video
+  entries (`VIDEO_DEFAULT_MODEL=xai/grok-imagine-video` fallback, video-only
+  reject-with-candidates, creation never retried).
+- Ticket 05: diagnose single chat-list fetch (sample id reuse), `stt`/`video`/
+  `image-to-text` probes (`DIAGNOSE_PROBE_KINDS`), shared `formatTriageLine`
+  (Status + diagnose), `NR_DEBUG=sync,timing` gated logging.
+- Ticket 06: video/image FATAL parity (`isFatalMediaStatus`, untruncated 403 via
+  `videoCreateError` + `fullError` transport), `fillModelCaps` hit telemetry
+  (`onHit` → `patternHits`), `capsClassOf`/`capsBadgeOf` provenance badges.
+- Ticket 07: 7d positive info cache (`infoCache`, merge-safe + pruned),
+  enrich progress streaming, `9router-usage.jsonl` cost/latency log + Status
+  summary, capability-aware auto-picker (`pickAutoDefaultModel`, rich row wins),
+  image batch presets (`prompts` via pure `planImageBatch`), browse
+  rich/thin/missing filters.
+- Ticket 08: regression tests locking 01–07 (twin isolation, negative cache,
+  refresh names, stale aging incl. chat, video resolve + FATAL parity, diagnose
+  single-fetch + voice probes + triage + NR_DEBUG, fullError, auto default +
+  batch, caps classes, usage log) + usage/dev doc deltas.
+- Core batch: `modelNames`/`infoCache` union-merge (stale in-memory refresh
+  never wipes fresh on-disk keys; patch wins per key), abort-during-enrich
+  fails the sync (no partial success), malformed cache lifecycle
+  (NaN/null/string/blob cache shapes dropped at sanitize → prune → merge →
+  reload, never resurrected), caps-only hint re-fallthrough (stale
+  pattern-derived hints re-run live inference for capless rows).
+- Hygiene batch: chat+image twins burn one info probe, kind-qualified
+  positive cache (no cross-kind reuse), enrich progress step math (~10
+  notifies at any scale, floor 1), video-poll `videoPollChanged` dedup,
+  usage-log rotation (256KB cap → last 1000 lines), honest counter split
+  (`formatInfoLine` — probed/hits/misses/cache-hits/negative-skips/rich-skips
+  each show their own counter; Status rows split from the triage line).
+- Tests+docs session: +18 tests this session (statusLines stale/Catalog/Stale rows,
+  video stale-default fallback, `videoPollChanged` direct seam,
+  sanitize TTL seams, usage-summary edges, `readUsageRecords` tail/guard,
+  `footerFromConfig`); rewrote 1 tautological test (`fillModelCaps`
+  unknown-id self-comparison → fresh-literal expectation); usage.md
+  infoCache key fix (kind-qualified, not bare-id); dev.md export list +
+  enrich dedupe/abort/progress notes.
+- Constraints: no loose-file install, no `pi install`, no publish (user-owned),
+  no live-config writes, no billed video e2e. Package-path verification only.
+- Video batch: restored `lastProgress` dedup (`videoPollChanged` — polls toast
+  only on status/progress advance, ~200 polls/job stay silent) with a
+  progress-callback counting test.
+- Video batch: custom/future video-model passthrough hatch
+  (`isVideoPassthroughId` — `provider/model` passes through verbatim with a
+  billing note, bare names reject with candidates; saved passthrough defaults
+  stay usable). Creation still never retried.
+- Video batch: auto default is explicit (`isAutoRichDefault` — announced in
+  the tool description, the `(auto)` status markers, and the result note;
+  saved defaults win, all-thin falls back quietly). Status rows now name the
+  model that actually runs.
+
+### Verified
+
+- `bun run typecheck` clean · `bun test` 226/226 (was 59 at 1.2.8).
+
+### Added
+
+- Release automation: `.github/workflows/publish.yml` publishes to npm via
+  OIDC trusted publishing when a GitHub Release tagged `vX.Y.Z` is published
+  (tag must match `package.json`; typecheck + tests re-run first). One-time
+  maintainer setup: npmjs.com → package Settings → Trusted Publisher
+  (`QMahyar` / `pi-9router` / `publish.yml`). No more OTP publish.
+
 ### Notes
 
-- None — 1.2.8 fixes pending publish (OTP required). See below: git ahead of npm remains for 1.2.6–1.2.8 until publish succeeds.
+- Structure: entry files grew this release (`9router.ts` → ~2.1k lines,
+  `9router-tools.ts` → ~2.1k) — new code went to shared helpers
+  (`formatTriageLine`, `isFatalMediaStatus`, `videoCreateError`,
+  `planImageBatch`, `videoPollChanged`, `pickAutoDefaultModel`) and pure
+exported seams for testability; full file decomposition deferred to a
+  follow-up so this release stays reviewable as one behavior change.
+- 1.2.6–1.2.8 were never published (OTP blocked); 1.2.9 supersedes them and
+  is the first release through the tag-driven OIDC pipeline.
 
 ---
 

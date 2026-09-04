@@ -18,8 +18,10 @@
  * Tool descriptions stay compact — they name the configured default model, not
  * the full catalog. A `model` argument is resolved against the catalog before
  * any request goes out; unknown ids are rejected with the available list.
- * Video has no catalog list endpoint — its tool defaults to the documented
- * `xai/grok-imagine-video` id and passes `model` through verbatim.
+ * Video has no catalog list endpoint — its tool falls back to the documented
+ * `xai/grok-imagine-video` id and resolves `model` through the shared
+ * resolveModel path against synced video entries when present (plus an
+ * explicit `provider/model` passthrough for custom/future video ids).
  *
  * Wire convention: /v1/images/generations, /v1/audio/speech, /v1/embeddings,
  * /v1/audio/transcriptions take the full catalog id; /v1/search and
@@ -53,18 +55,22 @@ import {
 	VOICE_PROVIDER_PREFIXES,
 	downloadUrl,
 	footerFromConfig,
+	formatUsageSummary,
 	hasLegacyKeys,
 	httpGetJson,
 	isSyncStale,
 	loadJsonFile,
+	logUsage,
 	normalizeEndpoint,
 	paintFooterStatus,
+	pickAutoDefaultModel,
 	postBinary,
 	postJson,
 	postMultipart,
 	resolveApiKey,
 	safeFilename,
 	saveJsonMerge,
+	type UsageRecord,
 } from "./lib/shared.ts";
 
 // ── Types ───────────────────────────────────────────────────────
@@ -117,11 +123,31 @@ function getCapState(cfg: ToolsConfigSlice, cap: CapDef): CapState {
 	return { ...defaultCapState(cap), ...(cfg.capabilities?.[cap.id] || {}) };
 }
 
+/**
+ * Documented video default. 9Router exposes no /v1/models/video list
+ * endpoint, so the catalog rarely holds video entries — resolveModel still
+ * routes through the shared path and falls back to this id.
+ */
+export const VIDEO_DEFAULT_MODEL = "xai/grok-imagine-video";
+
 function modelsForCap(cfg: ToolsConfigSlice, cap: CapDef): CatalogEntry[] {
 	const catalog = cfg.catalog || [];
 	const filter = cap.catalogKind;
-	if (typeof filter === "function") return catalog.filter(filter);
-	return catalog.filter((e) => e.kind === filter);
+	const models =
+		typeof filter === "function" ? catalog.filter(filter) : catalog.filter((e) => e.kind === filter);
+	if (cap.id === "video" && models.length === 0) {
+		// No list endpoint — synthesize the documented default so resolveModel,
+		// reject-with-candidates, and the compact description keep working.
+		return [
+			{
+				id: VIDEO_DEFAULT_MODEL,
+				name: "Grok Imagine video",
+				kind: "video",
+				note: "documented default (no video list endpoint)",
+			},
+		];
+	}
+	return models;
 }
 
 function normalizeId(s: string): string {
@@ -139,6 +165,34 @@ function isVoiceProviderId(id: string): boolean {
 	return VOICE_PROVIDER_PREFIXES.includes(id.slice(0, i));
 }
 
+/**
+ * Explicit escape hatch for custom/future video models. 9Router exposes no
+ * /v1/models/video list endpoint, so a brand-new provider video id can never
+ * appear in the synced catalog — a single-`/` `provider/model` id passes
+ * through verbatim (billed if valid; the server is the final validator).
+ * Bare names without a slash still reject with the available candidates.
+ */
+export function isVideoPassthroughId(id: string): boolean {
+	const i = id.indexOf("/");
+	return i > 0 && i < id.length - 1 && id.indexOf("/", i + 1) === -1;
+}
+
+/**
+ * True when omitting `model` would bill a capability-aware auto pick rather
+ * than a configured default: no saved default, no documented video default,
+ * and the rich-row pick differs from the first entry. The tool description
+ * and status rows announce this so the billed default is never silent — set
+ * an explicit default in /9router-tools to pin it.
+ */
+export function isAutoRichDefault(cfg: ToolsConfigSlice, cap: CapDef): boolean {
+	const models = modelsForCap(cfg, cap);
+	if (models.length === 0) return false;
+	if (getCapState(cfg, cap).model?.trim()) return false;
+	if (cap.id === "video" && models.some((m) => m.id === VIDEO_DEFAULT_MODEL)) return false;
+	const auto = pickAutoDefaultModel(models);
+	return !!auto && auto.id !== models[0]?.id;
+}
+
 type ModelResolution =
 	| { ok: true; id: string; note?: string }
 	| { ok: false; message: string };
@@ -152,9 +206,26 @@ export function resolveModel(cfg: ToolsConfigSlice, cap: CapDef, override?: stri
 
 	if (!want) {
 		const saved = getCapState(cfg, cap).model?.trim();
+		// Voice-provider ids are TTS-only: a saved voice id must never become
+		// the video model (the create call is billed per generation).
+		const savedVoiceOk = cap.id !== "video" && isVoiceProviderId(saved ?? "");
 		const usable =
-			saved && (models.some((m) => m.id === saved) || isVoiceProviderId(saved)) ? saved : undefined;
-		const fallback = usable || models[0]?.id;
+			saved &&
+			(models.some((m) => m.id === saved) ||
+				savedVoiceOk ||
+				// Covers the documented default plus custom/future video ids
+				// (never a TTS voice id — those are rejected for video below).
+				(cap.id === "video" && isVideoPassthroughId(saved) && !isVoiceProviderId(saved)))
+				? saved
+				: undefined;
+		// Video prefers the documented default when it is among the synced
+		// entries (modelsForCap already synthesizes it when none are synced).
+		const videoDefault =
+			cap.id === "video" ? models.find((m) => m.id === VIDEO_DEFAULT_MODEL)?.id : undefined;
+		// Capability-aware auto default: first rich row (live caps) wins over
+		// a thin first entry when the user omits `model` and no default is set.
+		const auto = pickAutoDefaultModel(models);
+		const fallback = usable || videoDefault || auto?.id;
 		if (!fallback) {
 			return {
 				ok: false,
@@ -164,7 +235,12 @@ export function resolveModel(cfg: ToolsConfigSlice, cap: CapDef, override?: stri
 		return {
 			ok: true,
 			id: fallback,
-			note: saved && !usable ? `default "${saved}" is no longer in the catalog — used ${fallback}` : undefined,
+			note:
+			saved && !usable
+				? `default "${saved}" is no longer in the catalog — used ${fallback}`
+				: isAutoRichDefault(cfg, cap)
+					? `auto default ${fallback} (rich caps)`
+					: undefined,
 		};
 	}
 
@@ -198,7 +274,29 @@ export function resolveModel(cfg: ToolsConfigSlice, cap: CapDef, override?: stri
 		if (partial.length > 1) return { ok: false, message: ambiguous(want, partial) };
 	}
 
-	if (isVoiceProviderId(want)) return { ok: true, id: want };
+	// The documented video id works even when it was never synced (no list endpoint).
+	if (cap.id === "video") {
+		if (want === VIDEO_DEFAULT_MODEL) return { ok: true, id: VIDEO_DEFAULT_MODEL };
+		const defaultKey = normalizeId(VIDEO_DEFAULT_MODEL);
+		const wantKey = normalizeId(want);
+		if (
+			want.toLowerCase() === VIDEO_DEFAULT_MODEL.toLowerCase() ||
+			(wantKey !== "" && (wantKey === defaultKey || wantKey === normalizeId(leafOf(VIDEO_DEFAULT_MODEL))))
+		) {
+			return { ok: true, id: VIDEO_DEFAULT_MODEL, note: `resolved "${want}" → ${VIDEO_DEFAULT_MODEL}` };
+		}
+	}
+
+	// Custom/future video models pass through verbatim (no list endpoint to
+	// sync them from) — bare names fall through to reject-with-candidates.
+	// TTS voice ids are excluded: provider/voice also has one slash, but a
+	// voice id as the video model would waste a billed create.
+	if (cap.id === "video" && isVideoPassthroughId(want) && !isVoiceProviderId(want)) {
+		return { ok: true, id: want, note: `passthrough video model "${want}" (not in catalog — billed if valid)` };
+	}
+
+	// Voice-provider ids are TTS-only — never a video model (billed create).
+	if (cap.id !== "video" && isVoiceProviderId(want)) return { ok: true, id: want };
 
 	return {
 		ok: false,
@@ -263,20 +361,35 @@ export function describeModels(cfg: ToolsConfigSlice, cap: CapDef): string {
  * ids are rejected with the available list (see resolveModel), and
  * /9router-tools browses the catalog interactively.
  */
-function withModelHint(cfg: ToolsConfigSlice, cap: CapDef, base: string): string {
+export function withModelHint(cfg: ToolsConfigSlice, cap: CapDef, base: string): string {
 	const models = modelsForCap(cfg, cap);
 	const n = models.length;
 	const saved = getCapState(cfg, cap).model?.trim();
+	// Voice-provider ids are TTS-only: never the announced video default.
+	const savedVoiceOk = cap.id !== "video" && isVoiceProviderId(saved ?? "");
 	const usable =
-		saved && (models.some((m) => m.id === saved) || isVoiceProviderId(saved))
+		saved &&
+		(models.some((m) => m.id === saved) ||
+			savedVoiceOk ||
+			// Covers the documented default plus custom/future video ids
+			// (never a TTS voice id — those are rejected for video).
+			(cap.id === "video" && isVideoPassthroughId(saved) && !isVoiceProviderId(saved)))
 			? saved
 			: undefined;
-	const def = usable || models[0]?.id;
+	// Video prefers the documented default when synced (mirrors resolveModel);
+	// modelsForCap synthesizes it when no video rows are synced.
+	const videoDefault =
+		cap.id === "video" ? models.find((m) => m.id === VIDEO_DEFAULT_MODEL)?.id : undefined;
+	// Otherwise the capability-aware auto default: first rich row wins
+	// (mirrors resolveModel — the hint must name the model that runs).
+	const def = usable || videoDefault || pickAutoDefaultModel(models)?.id;
+	// A billed auto pick is announced, never silent — pin it in /9router-tools.
+	const autoNote = isAutoRichDefault(cfg, cap) ? "; auto default — set a model in /9router-tools to pin it" : "";
 
 	const lines = [base, ""];
 	lines.push(
 		n
-			? `Default model: ${def ?? "(none set)"} (${n} available).`
+			? `Default model: ${def ?? "(none set)"} (${n} available${autoNote}).`
 			: "No models synced yet — run /9router → Sync models first.",
 	);
 	lines.push(
@@ -436,7 +549,12 @@ class ToolError extends Error {
 	}
 }
 
-function toolError(message: string, details: Record<string, unknown> = {}): never {
+function toolError(
+	message: string,
+	details: Record<string, unknown> = {},
+	usage?: ToolUsageCtx,
+): never {
+	if (usage) logUsage({ ...usageRec(usage), ok: false });
 	const keys = Object.keys(details);
 	const suffix = keys.length
 		? ` — ${keys.map((k) => `${k}: ${String(details[k])}`).join(", ")}`
@@ -444,8 +562,55 @@ function toolError(message: string, details: Record<string, unknown> = {}): neve
 	throw new ToolError(message + suffix, details);
 }
 
-function toolOk(text: string, details: Record<string, unknown> = {}) {
+function toolOk(text: string, details: Record<string, unknown> = {}, usage?: ToolUsageCtx) {
+	if (usage) logUsage({ ...usageRec(usage), ok: true });
 	return { content: [{ type: "text" as const, text }], details };
+}
+
+/** Latency/cost tracking for the bounded usage log (9router-usage.jsonl). */
+interface ToolUsageCtx {
+	tool: string;
+	model: string;
+	t0: number;
+	status?: number;
+	bytes?: number;
+	count?: number;
+}
+
+function usageRec(u: ToolUsageCtx): {
+	tool: string;
+	model: string;
+	ms: number;
+	status?: number;
+	bytes?: number;
+	count?: number;
+} {
+	const rec: { tool: string; model: string; ms: number; status?: number; bytes?: number; count?: number } = {
+		tool: u.tool,
+		model: u.model,
+		ms: Date.now() - u.t0,
+	};
+	if (u.status != null) rec.status = u.status;
+	if (u.bytes != null) rec.bytes = u.bytes;
+	if (u.count != null) rec.count = u.count;
+	return rec;
+}
+
+/**
+ * Usage record for gate rejections (cap off / no catalog / unknown model).
+ * Gates throw before t0/model exist, so they never build a ToolUsageCtx —
+ * without this record they bypassed the usage log entirely. Every
+ * `blocked` / `!picked.ok` branch logs one before throwing.
+ */
+export function gateUsageRec(tool: string, note: string, model?: string): UsageRecord {
+	const trimmed = model?.trim();
+	return {
+		tool,
+		...(trimmed ? { model: trimmed } : {}),
+		ms: 0,
+		ok: false,
+		note,
+	};
 }
 
 function needSyncHint(): string {
@@ -491,7 +656,10 @@ function capRow(cfg: ToolsConfigSlice, cap: CapDef): string {
 	const st = getCapState(cfg, cap);
 	const n = modelsForCap(cfg, cap).length;
 	const status = st.enabled ? "On " : "Off";
-	const model = st.enabled ? shortModel(st.model || modelsForCap(cfg, cap)[0]?.id) : "—";
+	// An auto-picked billed default is marked — pin it via Default model.
+	const auto = st.enabled && !st.model && isAutoRichDefault(cfg, cap);
+	const picked = st.model || pickAutoDefaultModel(modelsForCap(cfg, cap))?.id;
+	const model = st.enabled ? shortModel(picked) + (auto ? " (auto)" : "") : "—";
 	return `${padLabel(cap.label, 18)}  ${status}  ${padLabel(model, 34)}  ${n ? n + " models" : "no models"}`;
 }
 
@@ -529,10 +697,11 @@ async function configureCap(
 	while (true) {
 		const st = getCapState(cfg, cap);
 		const n = modelsForCap(cfg, cap).length;
-		const def = st.model || (n ? modelsForCap(cfg, cap)[0]?.id : undefined);
+		const def = st.model || (n ? pickAutoDefaultModel(modelsForCap(cfg, cap))?.id : undefined);
+		const auto = !st.model && isAutoRichDefault(cfg, cap);
 		const choice = await ui.select(cap.label, [
 			st.enabled ? "Turn off" : "Turn on",
-			`Default model: ${shortModel(def, 48)}`,
+			`Default model: ${shortModel(def, 48)}${auto ? " (auto)" : ""}`,
 			"Browse models",
 			"Back",
 		]);
@@ -594,7 +763,11 @@ async function showStatus(ui: ExtensionContext["ui"], cfg: ToolsConfigSlice): Pr
 		...CAPS.map((cap) => {
 			const st = getCapState(cfg, cap);
 			const n = modelsForCap(cfg, cap).length;
-			return `${st.enabled ? "ON " : "off"}  ${padLabel(cap.tool, 18)}  ${shortModel(st.model || modelsForCap(cfg, cap)[0]?.id, 40)}  (${n})`;
+			// Status must name the model that actually runs (auto pick),
+			// marked so a billed auto default is never silent.
+			const auto = !st.model && isAutoRichDefault(cfg, cap);
+			const picked = st.model || pickAutoDefaultModel(modelsForCap(cfg, cap))?.id;
+			return `${st.enabled ? "ON " : "off"}  ${padLabel(cap.tool, 18)}  ${shortModel(picked, 40)}${auto ? " (auto)" : ""}  (${n})`;
 		}),
 	];
 	await ui.confirm("Status", lines.join("\n"));
@@ -708,6 +881,60 @@ async function truncateResult(
 /** Definitive failures — retrying with another response_format cannot help. */
 const FATAL_STATUSES = [401, 402, 403];
 
+/**
+ * True for definitive HTTP failures (bad/unauthorized key, unpaid/plan-gated
+ * account). Callers must abort immediately — retrying cannot help. Shared by
+ * the image and video paths.
+ */
+export function isFatalMediaStatus(status: number): boolean {
+	return FATAL_STATUSES.includes(status);
+}
+
+/**
+ * Full create-error text for video generation. A 403 keeps the
+ * account-access explanation plus the server detail (bounded 2KB at the
+ * transport — never silently truncated to the 400-char default); every
+ * other status reports `Video job submission failed (status): detail`.
+ */
+export function videoCreateError(status: number, serverError: string): string {
+	if (status === 0) {
+		// No HTTP response (network/timeout/abort) — the create POST may still
+		// have landed server-side (billed) but no request_id came back to poll.
+		return `Video job submission failed before a response (status 0): ${serverError} — the job may still have been created but no request_id was returned, so it cannot be polled; check the 9Router dashboard.`;
+	}
+	if (status === 403) {
+		const tail = serverError ? ` Server: ${serverError}` : "";
+		return `Video generation refused (403): the connected xAI account has no video access (needs SuperGrok/X Premium+ or an xAI API key with video quota).${tail}`;
+	}
+	return `Video job submission failed (${status}): ${serverError}`;
+}
+
+/** One image-generation job: prompt plus an optional output filename. */
+export interface ImageBatchJob {
+	prompt: string;
+	filename?: string;
+}
+
+/**
+ * Batch-preset planning for nr_image_generate (ticket 7): up to 4
+ * non-blank prompts, one image each (`n` is ignored when a batch is
+ * present); otherwise `n` (clamped 1–4) images of the single prompt.
+ * Pure — locked by regression tests.
+ */
+export function planImageBatch(params: {
+	prompt: string;
+	prompts?: string[];
+	n?: number;
+	filename?: string;
+}): { batch: string[]; n: number; jobs: ImageBatchJob[] } {
+	const batch = (params.prompts || []).map((p) => p.trim()).filter(Boolean).slice(0, 4);
+	const n = batch.length ? 1 : Math.min(params.n ?? 1, 4);
+	const jobs: ImageBatchJob[] = batch.length
+		? batch.map((prompt) => ({ prompt, filename: undefined as string | undefined }))
+		: [{ prompt: params.prompt, filename: params.filename }];
+	return { batch, n, jobs };
+}
+
 /** True when a 200 body is actually JSON (error or b64/url payload), not raw bytes. */
 function bodyIsJson(contentType: string, bytes: Uint8Array): boolean {
 	return contentType.toLowerCase().includes("json") || bytes[0] === 0x7b /* { */;
@@ -788,7 +1015,7 @@ async function generateImages(opts: {
 					const url = res2.data.data[j].url;
 					if (!url) continue;
 					const dl = await downloadUrl(url, { signal });
-					if (!dl) continue;
+					if (!dl.ok) continue;
 					const ext = extFromContentType(dl.contentType, ".png");
 					const nm = `img-${stamp()}-${slug(prompt)}-${j}-${randomBytes(2).toString("hex")}${ext}`;
 					saved.push(await writeBytes(outDir, nm, dl.bytes));
@@ -832,7 +1059,7 @@ async function generateImages(opts: {
 			const url = res2.data.data[j].url;
 			if (!url) continue;
 			const dl = await downloadUrl(url, { signal });
-			if (!dl) continue;
+			if (!dl.ok) continue;
 			const ext = extFromContentType(dl.contentType, ".png");
 			const nm = `img-${stamp()}-${slug(prompt)}-${i}-${j}-${randomBytes(2).toString("hex")}${ext}`;
 			saved.push(await writeBytes(outDir, nm, dl.bytes));
@@ -853,18 +1080,24 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 		description: withModelHint(
 			cfg,
 			cap,
-			"Generate an image through 9Router and save it to disk. Best for icons, logos, illustrations, UI mockups, and concept art. Optional image_path / image_paths enable edit/img2img with 1–4 reference images when the model supports it. Returns the saved file path; the image itself is not embedded in the result by default.",
+			"Generate an image through 9Router and save it to disk. Best for icons, logos, illustrations, UI mockups, and concept art. Optional image_path / image_paths enable edit/img2img with 1–4 reference images when the model supports it. Pass prompts (up to 4) for a batch — one image per prompt. Returns the saved file path; the image itself is not embedded in the result by default.",
 		),
 		promptSnippet: "Generate an image (9Router) and save the file path",
 		promptGuidelines: [
 			"Call nr_image_generate to create images, icons, logos, illustrations, or mockups.",
 			"Write a detailed prompt (subject, style, colors, composition).",
-			"Omit model unless the user names a specific image model; when they do, pass its exact catalog id (browse via /9router-tools if unsure). Optional size, quality, n (1–4), filename, image_path (single reference image for edit/img2img), image_paths (up to 4 references).",
+			"Omit model unless the user names a specific image model; when they do, pass its exact catalog id (browse via /9router-tools if unsure). Optional size, quality, n (1–4), filename, image_path (single reference image for edit/img2img), image_paths (up to 4 references), prompts (batch of up to 4 prompts — one image each, n is ignored).",
 			"Tell the user the saved file path from the tool result.",
 			"The image is not embedded in the result — read the returned path if you need to see it.",
 		],
 		parameters: Type.Object({
 			prompt: Type.String({ description: "Image prompt: subject, style, colors, composition" }),
+			prompts: Type.Optional(
+				Type.Array(Type.String(), {
+					maxItems: 4,
+					description: "Batch presets: up to 4 prompts, one image per preset (n is ignored when set)",
+				}),
+			),
 			model: Type.Optional(Type.String({ description: "Image model id (optional; uses /9router-tools default)" })),
 			size: Type.Optional(Type.String({ description: "Size if supported, e.g. 1024x1024" })),
 			n: Type.Optional(Type.Integer({ description: "Number of images, 1–4 (default 1)", minimum: 1, maximum: 4 })),
@@ -907,15 +1140,29 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 		async execute(_id, params, signal, onUpdate, ctx) {
 			const cfg = loadRaw();
 			const blocked = needCap(cfg, cap);
-			if (blocked) return toolError(blocked);
+			if (blocked) {
+				logUsage(gateUsageRec(cap.tool, blocked, params.model));
+				return toolError(blocked);
+			}
 			const picked = resolveModel(cfg, cap, params.model);
-			if (!picked.ok) return toolError(picked.message, { requested: params.model });
+			if (!picked.ok) {
+				logUsage(gateUsageRec(cap.tool, picked.message, params.model));
+				return toolError(picked.message, { requested: params.model });
+			}
 			const model = picked.id;
+			const t0 = Date.now();
+			const use = (extra?: Partial<Omit<ToolUsageCtx, "tool" | "model" | "t0">>): ToolUsageCtx => ({
+				tool: cap.tool,
+				model,
+				t0,
+				...extra,
+			});
 
 			const ep = endpointOf(cfg);
 			const key = apiKeyOf(cfg);
 			const outDir = outputDirOf(cfg);
-			const n = Math.min(params.n ?? 1, 4);
+			// Batch presets: one image per prompt (n is ignored); else n images of prompt.
+			const { batch, n, jobs } = planImageBatch(params);
 
 			const refsRaw = [
 				...(params.image_path?.trim() ? [params.image_path] : []),
@@ -925,7 +1172,7 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			for (const ref of refsRaw) {
 				const loaded = await loadImageRef(ref, ctx.cwd);
 				if (!loaded) {
-					return toolError(`Could not read reference image: ${ref}`, { image_path: ref });
+					return toolError(`Could not read reference image: ${ref}`, { image_path: ref }, use());
 				}
 				imageUrls.push(loaded);
 			}
@@ -934,35 +1181,45 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 				content: [
 					{
 						type: "text",
-						text: `Generating ${n} image(s) with ${model}${imageUrls.length ? ` (${imageUrls.length} ref image${imageUrls.length > 1 ? "s" : ""})` : ""}…`,
+						text: batch.length
+							? `Generating batch of ${batch.length} images with ${model}…`
+							: `Generating ${n} image(s) with ${model}${imageUrls.length ? ` (${imageUrls.length} ref image${imageUrls.length > 1 ? "s" : ""})` : ""}…`,
 					},
 				],
 				details: {},
 			});
 
-			const { saved, error } = await generateImages({
-				ep,
-				key,
-				outDir,
-				model,
-				prompt: params.prompt,
-				n,
-				size: params.size,
-				quality: params.quality,
-				filename: params.filename,
-				imageUrls,
-				signal,
-			});
+			const saved: string[] = [];
+			let firstError: string | undefined;
+			for (const [i, job] of jobs.entries()) {
+				if (signal?.aborted) break;
+				if (jobs.length > 1) onUpdate?.({ content: [{ type: "text", text: `Batch ${i + 1}/${jobs.length}…` }], details: {} });
+				const r = await generateImages({
+					ep,
+					key,
+					outDir,
+					model,
+					prompt: job.prompt,
+					n,
+					size: params.size,
+					quality: params.quality,
+					filename: job.filename,
+					imageUrls,
+					signal,
+				});
+				saved.push(...r.saved);
+				if (r.error && !firstError) firstError = r.error;
+			}
 
-			if (error && !saved.length) return toolError(error, { model });
-			if (!saved.length) return toolError("No image data returned.", { model });
+			if (firstError && !saved.length) return toolError(firstError, { model }, use());
+			if (!saved.length) return toolError("No image data returned.", { model }, use());
 
 			const text = [
 				`Generated ${saved.length} image(s) · ${model}`,
 				picked.note ? `Model ${picked.note}` : "",
 				refsRaw.length ? `Reference${refsRaw.length > 1 ? "s" : ""}: ${refsRaw.join(", ")}` : "",
-				`Prompt: ${params.prompt}`,
-				error ? `Note: ${error}` : "",
+				...(batch.length ? batch.map((p) => `Prompt: ${p}`) : [`Prompt: ${params.prompt}`]),
+				firstError ? `Note: ${firstError}` : "",
 				...saved.map((p) => `File: ${p}`),
 			]
 				.filter(Boolean)
@@ -995,6 +1252,7 @@ function registerImageTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 				}
 			}
 
+			logUsage({ tool: cap.tool, model, ms: Date.now() - t0, ok: true, count: saved.length });
 			return {
 				content,
 				details: {
@@ -1045,10 +1303,23 @@ function registerTtsTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 		async execute(_id, params, signal, onUpdate) {
 			const cfg = loadRaw();
 			const blocked = needCap(cfg, cap);
-			if (blocked) return toolError(blocked);
+			if (blocked) {
+				logUsage(gateUsageRec(cap.tool, blocked, params.model));
+				return toolError(blocked);
+			}
 			const picked = resolveModel(cfg, cap, params.model);
-			if (!picked.ok) return toolError(picked.message, { requested: params.model });
+			if (!picked.ok) {
+				logUsage(gateUsageRec(cap.tool, picked.message, params.model));
+				return toolError(picked.message, { requested: params.model });
+			}
 			const model = picked.id;
+			const t0 = Date.now();
+			const use = (extra?: Partial<Omit<ToolUsageCtx, "tool" | "model" | "t0">>): ToolUsageCtx => ({
+				tool: cap.tool,
+				model,
+				t0,
+				...extra,
+			});
 			onUpdate?.({ content: [{ type: "text", text: `Synthesizing · ${model}` }], details: {} });
 
 			const ep = endpointOf(cfg);
@@ -1080,7 +1351,7 @@ function registerTtsTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 								typeof parsed.error === "object" && parsed.error !== null && "message" in parsed.error
 									? String((parsed.error as { message: unknown }).message)
 									: String(parsed.error);
-							return toolError(`TTS failed (200 JSON body): ${msg}`, { model });
+							return toolError(`TTS failed (200 JSON body): ${msg}`, { model }, use());
 						}
 					} catch {
 						/* fall through to the json request below */
@@ -1107,11 +1378,11 @@ function registerTtsTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 						: !res.ok
 							? `json HTTP ${res.status}: ${res.error}`
 							: "no audio field in json response";
-					return toolError(`TTS failed (${detail})`, { model });
+					return toolError(`TTS failed (${detail})`, { model }, use({ status: !bin.ok ? bin.status : !res.ok ? res.status : undefined }));
 				}
 			}
 
-			if (!bytes?.length) return toolError("Empty audio.", { model });
+			if (!bytes?.length) return toolError("Empty audio.", { model }, use());
 			const name =
 				(params.filename && withExt(safeFilename(params.filename), ext)) ||
 				`tts-${stamp()}-${slug(params.input)}${ext}`;
@@ -1127,6 +1398,7 @@ function registerTtsTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 					.filter(Boolean)
 					.join("\n"),
 				{ model, file: path, bytes: bytes.length },
+				use({ bytes: bytes.length }),
 			);
 		},
 		renderResult(result, { expanded }, theme) {
@@ -1161,10 +1433,23 @@ function registerEmbedTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 		async execute(_id, params, signal, onUpdate) {
 			const cfg = loadRaw();
 			const blocked = needCap(cfg, cap);
-			if (blocked) return toolError(blocked);
+			if (blocked) {
+				logUsage(gateUsageRec(cap.tool, blocked, params.model));
+				return toolError(blocked);
+			}
 			const picked = resolveModel(cfg, cap, params.model);
-			if (!picked.ok) return toolError(picked.message, { requested: params.model });
+			if (!picked.ok) {
+				logUsage(gateUsageRec(cap.tool, picked.message, params.model));
+				return toolError(picked.message, { requested: params.model });
+			}
 			const model = picked.id;
+			const t0 = Date.now();
+			const use = (extra?: Partial<Omit<ToolUsageCtx, "tool" | "model" | "t0">>): ToolUsageCtx => ({
+				tool: cap.tool,
+				model,
+				t0,
+				...extra,
+			});
 			const parts = params.input.includes("\n---\n")
 				? params.input
 						.split("\n---\n")
@@ -1178,10 +1463,10 @@ function registerEmbedTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 				signal,
 				timeoutMs: TIMEOUT.tool,
 			});
-			if (!res.ok) return toolError(`Embeddings failed (${res.status}): ${res.error}`, { model });
+			if (!res.ok) return toolError(`Embeddings failed (${res.status}): ${res.error}`, { model }, use({ status: res.status }));
 			const data = Array.isArray(res.data?.data) ? res.data.data : [];
 			if (!data.length) {
-				return toolError(`Embeddings returned no vectors.`, { model, inputs: parts.length });
+				return toolError(`Embeddings returned no vectors.`, { model, inputs: parts.length }, use());
 			}
 			const lines = [`Model: ${model}`, `Inputs: ${parts.length}`, `Vectors: ${data.length}`];
 			for (const row of data) {
@@ -1207,7 +1492,7 @@ function registerEmbedTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 					lines.push(`(full vectors capped at ${maxFull} of ${data.length})`);
 				}
 			}
-			return toolOk(lines.join("\n"), details);
+			return toolOk(lines.join("\n"), details, use({ count: data.length }));
 		},
 		renderResult(result, { expanded }, theme) {
 			const d = (result.details || {}) as { count?: number; dimensions?: number; model?: string };
@@ -1257,10 +1542,23 @@ function registerWebSearchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 		async execute(_id, params, signal, onUpdate) {
 			const cfg = loadRaw();
 			const blocked = needCap(cfg, cap);
-			if (blocked) return toolError(blocked);
+			if (blocked) {
+				logUsage(gateUsageRec(cap.tool, blocked, params.model));
+				return toolError(blocked);
+			}
 			const picked = resolveModel(cfg, cap, params.model);
-			if (!picked.ok) return toolError(picked.message, { requested: params.model });
+			if (!picked.ok) {
+				logUsage(gateUsageRec(cap.tool, picked.message, params.model));
+				return toolError(picked.message, { requested: params.model });
+			}
 			const model = picked.id;
+			const t0 = Date.now();
+			const use = (extra?: Partial<Omit<ToolUsageCtx, "tool" | "model" | "t0">>): ToolUsageCtx => ({
+				tool: cap.tool,
+				model,
+				t0,
+				...extra,
+			});
 			// Wire: bare provider ("exa"), not catalog id ("exa/search")
 			const apiModel = model.replace(/\/search$/i, "");
 			onUpdate?.({ content: [{ type: "text", text: `Searching · ${apiModel}` }], details: {} });
@@ -1278,7 +1576,7 @@ function registerWebSearchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 				signal,
 				timeoutMs: TIMEOUT.tool,
 			});
-			if (!res.ok) return toolError(`Search failed (${res.status}): ${res.error}`, { model, query: params.query });
+			if (!res.ok) return toolError(`Search failed (${res.status}): ${res.error}`, { model, query: params.query }, use({ status: res.status }));
 			const results = res.data?.results || res.data?.data || [];
 			const lines = [
 				`Query: ${params.query}`,
@@ -1303,7 +1601,7 @@ function registerWebSearchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 				query: params.query,
 				resultCount: Array.isArray(results) ? results.length : 0,
 				urls: Array.isArray(results) ? results.map((r: any) => r.url).filter(Boolean) : [],
-			});
+			}, use({ count: Array.isArray(results) ? results.length : 0 }));
 		},
 		renderResult(result, { expanded }, theme) {
 			const d = (result.details || {}) as { query?: string; resultCount?: number };
@@ -1344,12 +1642,25 @@ function registerWebFetchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 		async execute(_id, params, signal, onUpdate) {
 			const cfg = loadRaw();
 			const blocked = needCap(cfg, cap);
-			if (blocked) return toolError(blocked);
+			if (blocked) {
+				logUsage(gateUsageRec(cap.tool, blocked, params.model));
+				return toolError(blocked);
+			}
 			const picked = resolveModel(cfg, cap, params.model);
-			if (!picked.ok) return toolError(picked.message, { requested: params.model });
+			if (!picked.ok) {
+				logUsage(gateUsageRec(cap.tool, picked.message, params.model));
+				return toolError(picked.message, { requested: params.model });
+			}
 			const model = picked.id;
+			const t0 = Date.now();
+			const use = (extra?: Partial<Omit<ToolUsageCtx, "tool" | "model" | "t0">>): ToolUsageCtx => ({
+				tool: cap.tool,
+				model,
+				t0,
+				...extra,
+			});
 			const apiModel = model.replace(/\/fetch$/i, "");
-			if (!/^https?:\/\//i.test(params.url)) return toolError("url must be absolute http(s)");
+			if (!/^https?:\/\//i.test(params.url)) return toolError("url must be absolute http(s)", {}, use());
 			onUpdate?.({ content: [{ type: "text", text: `Fetching · ${params.url}` }], details: {} });
 			const body: Record<string, unknown> = {
 				model: apiModel,
@@ -1363,7 +1674,7 @@ function registerWebFetchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			if (!res.ok && res.status === 404) {
 				res = await postJson(`${ep}/v1/fetch`, key, body, { signal, timeoutMs: TIMEOUT.tool });
 			}
-			if (!res.ok) return toolError(`Fetch failed (${res.status}): ${res.error}`, { model, url: params.url });
+			if (!res.ok) return toolError(`Fetch failed (${res.status}): ${res.error}`, { model, url: params.url }, use({ status: res.status }));
 			const data = res.data || {};
 			const contentObj = data.content;
 			const textBody =
@@ -1384,7 +1695,7 @@ function registerWebFetchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 				url: params.url,
 				title: data.title,
 				length: contentObj?.length ?? bodyText.length,
-			});
+			}, use({ bytes: bodyText.length }));
 		},
 		renderResult(result, { expanded }, theme) {
 			const d = (result.details || {}) as { url?: string; title?: string };
@@ -1396,11 +1707,29 @@ function registerWebFetchTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 // ── Video (Grok Imagine) ────────────────────────────────────────
 
 /**
- * 9Router has no /v1/models/video list endpoint — this documented id is the
- * default; `model` overrides pass through verbatim.
+ * Video creation is billed per generation — the create call below runs
+ * exactly once (never retried); only the status polls tolerate transient
+ * failures. FATAL 401/402/403 aborts immediately in both create and poll
+ * (same set as image generation). Timeouts: 600s overall deadline
+ * (TIMEOUT.video), 3s abort-aware poll interval, 60s MP4 download
+ * (TIMEOUT.download). A 403 means the connected account has no video access.
  */
-const VIDEO_DEFAULT_MODEL = "xai/grok-imagine-video";
-const VIDEO_POLL_INTERVAL_MS = 3_000;
+export const VIDEO_POLL_INTERVAL_MS = 3_000;
+
+/**
+ * Dedup predicate for video-poll progress toasts. A 10-minute generation
+ * polls every 3 s (~200 polls/job) — notifying on every poll spams the chat
+ * with toasts, so only status/progress advances toast (lastProgress dedup).
+ * Pure test seam: fold a poll sequence through it and count the `true`
+ * returns to get the toast count (see tests/tools.test.ts).
+ */
+export function videoPollChanged(
+	last: { status?: string; progress?: number },
+	job: { status?: string; progress?: number },
+): boolean {
+	if (job.progress != null && job.progress !== last.progress) return true;
+	return job.status !== last.status;
+}
 
 interface VideoJob {
 	status: string;
@@ -1414,12 +1743,15 @@ function registerVideoTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 	pi.registerTool({
 		name: cap.tool,
 		label: "Video",
-		description:
+		description: withModelHint(
+			cfg,
+			cap,
 			"Generate a short video through 9Router (Grok Imagine) and save it as an MP4. Text-to-video, or image-to-video with an optional image_path reference. Generation is async — the tool polls until done (up to 10 minutes) and returns the saved file path. Expensive per generation; use deliberately, not for experiments.",
+		),
 		promptSnippet: "Generate a video (9Router/Grok Imagine) and save the MP4",
 		promptGuidelines: [
 			"Call nr_video_generate only when the user explicitly asks for a video.",
-			"Write a concrete prompt (subject, motion, style, scene). Optional duration (seconds), aspect_ratio, resolution, image_path for image-to-video.",
+			"Write a concrete prompt (subject, motion, style, scene). Optional duration (seconds), aspect_ratio, resolution, image_path for image-to-video. Omit model unless the user names a specific video model; when they do, pass its exact catalog id (browse via /9router-tools if unsure).",
 			"Generation takes tens of seconds to minutes — set expectations, do not spam retries.",
 			"Report the saved MP4 path when done.",
 		],
@@ -1450,8 +1782,23 @@ function registerVideoTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 		async execute(_id, params, signal, onUpdate, ctx) {
 			const cfg = loadRaw();
 			const blocked = needCap(cfg, cap);
-			if (blocked) return toolError(blocked);
-			const model = params.model?.trim() || VIDEO_DEFAULT_MODEL;
+			if (blocked) {
+				logUsage(gateUsageRec(cap.tool, blocked, params.model));
+				return toolError(blocked);
+			}
+			const picked = resolveModel(cfg, cap, params.model);
+			if (!picked.ok) {
+				logUsage(gateUsageRec(cap.tool, picked.message, params.model));
+				return toolError(picked.message, { requested: params.model });
+			}
+			const model = picked.id;
+			const t0 = Date.now();
+			const use = (extra?: Partial<Omit<ToolUsageCtx, "tool" | "model" | "t0">>): ToolUsageCtx => ({
+				tool: cap.tool,
+				model,
+				t0,
+				...extra,
+			});
 
 			const ep = endpointOf(cfg);
 			const key = apiKeyOf(cfg);
@@ -1463,7 +1810,7 @@ function registerVideoTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 				if (!imageUrl) {
 					return toolError(`Could not read image_path: ${params.image_path}`, {
 						image_path: params.image_path,
-					});
+					}, use());
 				}
 			}
 
@@ -1480,28 +1827,29 @@ function registerVideoTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 			const create = await postJson(`${ep}/v1/videos/generations`, key, body, {
 				signal,
 				timeoutMs: TIMEOUT.tool,
+				// Bounded 2KB detail (FULL_ERROR_MAX) — videoCreateError relays it.
+				fullError: true,
 			});
 			if (!create.ok) {
-				if (create.status === 403) {
-					return toolError(
-						`Video generation refused (403): the connected xAI account has no video access (needs SuperGrok/X Premium+ or an xAI API key with video quota).`,
-						{ model },
-					);
-				}
-				return toolError(`Video job submission failed (${create.status}): ${create.error}`, { model });
+				// Create runs exactly once (billed) — every failure aborts
+				// immediately; FATAL statuses keep the full 403 explanation.
+				return toolError(videoCreateError(create.status, create.error), { model }, use({ status: create.status }));
 			}
 			const requestId = create.data?.request_id;
 			if (!requestId) {
-				return toolError(`Video job submission returned no request_id: ${JSON.stringify(create.data).slice(0, 200)}`, { model });
+				return toolError(`Video job submission returned no request_id: ${JSON.stringify(create.data).slice(0, 200)}`, { model }, use());
 			}
 			// Jobs are account-bound — polls must carry the creating connection id.
 			const connectionId =
 				create.headers["x-9router-connection-id"] || create.headers["x-connection-id"];
 
 			const deadline = Date.now() + TIMEOUT.video;
-			let lastProgress = -1;
+			const tPollStart = Date.now();
+			let polls = 0;
+			let lastProgress: number | undefined;
+			let lastStatus: string | undefined;
 			while (Date.now() < deadline) {
-				if (signal?.aborted) return toolError("Video generation aborted.", { model, request_id: requestId });
+				if (signal?.aborted) return toolError("Video generation aborted.", { model, request_id: requestId }, use());
 				try {
 					await new Promise<void>((resolve, reject) => {
 						const t = setTimeout(resolve, VIDEO_POLL_INTERVAL_MS);
@@ -1511,7 +1859,7 @@ function registerVideoTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 						}
 					});
 				} catch {
-					return toolError("Video generation aborted.", { model, request_id: requestId });
+					return toolError("Video generation aborted.", { model, request_id: requestId }, use());
 				}
 				const poll = await httpGetJson<VideoJob>(
 					`${ep}/v1/videos/${encodeURIComponent(requestId)}`,
@@ -1519,24 +1867,40 @@ function registerVideoTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 					{
 						signal,
 						timeoutMs: TIMEOUT.info,
+						// FATAL poll errors surface poll.error — bounded 2KB detail.
+						fullError: true,
 						...(connectionId ? { headers: { "x-connection-id": connectionId } } : {}),
 					},
 				);
 				if (!poll.ok) {
-					// Transient poll failures are tolerated; the deadline bounds the wait.
+					// FATAL poll failures abort immediately (mirrors generateImages);
+					// transient poll failures are tolerated until the deadline.
+					if (isFatalMediaStatus(poll.status)) {
+						return toolError(`Video job poll refused (${poll.status}): ${poll.error}`, { model, request_id: requestId }, use({ status: poll.status }));
+					}
+					polls++;
+					onUpdate?.({
+						content: [{ type: "text", text: `Video pending · poll ${polls} · ${Math.round((Date.now() - tPollStart) / 1000)}s (retrying)…` }],
+						details: {},
+					});
 					continue;
 				}
 				const job = poll.data || ({} as VideoJob);
-				if (job.progress != null && job.progress !== lastProgress) {
+				// Dedup: a full-length job polls ~200 times — toast only when
+				// status/progress actually advanced (lastProgress dedup). Abort
+				// stays effective via the loop-top check and the abort-aware sleep.
+				polls++;
+				if (videoPollChanged({ status: lastStatus, progress: lastProgress }, job)) {
+					lastStatus = job.status;
 					lastProgress = job.progress;
 					onUpdate?.({
-						content: [{ type: "text", text: `Video ${job.status || "pending"} · ${job.progress}%` }],
+						content: [{ type: "text", text: `Video ${job.status || "pending"} · ${job.progress ?? "?"}% · ${Math.round((Date.now() - tPollStart) / 1000)}s (poll ${polls})` }],
 						details: {},
 					});
 				}
 				if (job.status === "done" && job.video?.url) {
 					const dl = await downloadUrl(job.video.url, { signal, timeoutMs: TIMEOUT.download });
-					if (!dl) return toolError("Video completed but the download failed.", { model, request_id: requestId, url: job.video.url });
+					if (!dl.ok) return toolError(`Video completed but the MP4 download failed (${dl.status}): ${dl.error}`, { model, request_id: requestId, url: job.video.url }, use({ status: dl.status }));
 					const name = withExt(
 						params.filename ? safeFilename(params.filename) : `video-${stamp()}-${slug(params.prompt)}`,
 						".mp4",
@@ -1546,6 +1910,7 @@ function registerVideoTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 						[
 							"Video saved.",
 							`Model: ${model}`,
+							picked.note ? `Model ${picked.note}` : "",
 							`File: ${path}`,
 							job.video.duration ? `Duration: ${job.video.duration}s` : "",
 							`Prompt: ${params.prompt}`,
@@ -1553,19 +1918,21 @@ function registerVideoTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 							.filter(Boolean)
 							.join("\n"),
 						{ model, file: path, url: job.video.url, duration: job.video.duration, request_id: requestId },
+						use({ bytes: dl.bytes.byteLength }),
 					);
 				}
 				if (job.status === "failed") {
 					return toolError(
 						`Video generation failed${job.error?.code ? ` (${job.error.code})` : ""}: ${job.error?.message || "no error detail"}`,
 						{ model, request_id: requestId },
+						use(),
 					);
 				}
 			}
 			return toolError(`Video generation timed out after ${Math.round(TIMEOUT.video / 1000)}s — the job may still finish; check the 9Router dashboard.`, {
 				model,
 				request_id: requestId,
-			});
+			}, use());
 		},
 		renderResult(result, { expanded }, theme) {
 			const d = (result.details || {}) as { file?: string; request_id?: string };
@@ -1619,12 +1986,23 @@ function registerSttTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 		async execute(_id, params, signal, onUpdate, ctx) {
 			const cfg = loadRaw();
 			const blocked = needCap(cfg, cap);
-			if (blocked) return toolError(blocked);
+			if (blocked) {
+				logUsage(gateUsageRec(cap.tool, blocked, params.model));
+				return toolError(blocked);
+			}
 			const picked = resolveModel(cfg, cap, params.model);
 			if (!picked.ok) {
+				logUsage(gateUsageRec(cap.tool, picked.message, params.model));
 				return toolError(picked.message, { requested: params.model });
 			}
 			const model = picked.id;
+			const t0 = Date.now();
+			const use = (extra?: Partial<Omit<ToolUsageCtx, "tool" | "model" | "t0">>): ToolUsageCtx => ({
+				tool: cap.tool,
+				model,
+				t0,
+				...extra,
+			});
 
 			const target = params.file_path.trim().replace(/^@/, "");
 			const cwd = (ctx as { cwd?: string })?.cwd || process.cwd();
@@ -1635,11 +2013,11 @@ function registerSttTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 				if (st.size > MAX_STT_BYTES) {
 					return toolError(`Audio file too large (${Math.round(st.size / 1024 / 1024)} MB; limit 25 MB).`, {
 						file_path: params.file_path,
-					});
+					}, use());
 				}
 				bytes = await readFile(abs);
 			} catch {
-				return toolError(`Could not read audio file: ${params.file_path}`, { file_path: params.file_path });
+				return toolError(`Could not read audio file: ${params.file_path}`, { file_path: params.file_path }, use());
 			}
 
 			const ext = extname(abs).toLowerCase();
@@ -1647,6 +2025,7 @@ function registerSttTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 				return toolError(
 					`Unsupported audio format "${ext}" — expected mp3, wav, m4a, webm, ogg, or flac.`,
 					{ file_path: params.file_path },
+					use(),
 				);
 			}
 
@@ -1664,7 +2043,7 @@ function registerSttTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 				signal,
 				timeoutMs: TIMEOUT.tool,
 			});
-			if (!res.ok) return toolError(`Transcription failed (${res.status}): ${res.error}`, { model });
+			if (!res.ok) return toolError(`Transcription failed (${res.status}): ${res.error}`, { model }, use({ status: res.status }));
 
 			// json/verbose_json bodies carry {text}; text/srt/vtt are the payload itself.
 			let transcript = res.text;
@@ -1678,7 +2057,7 @@ function registerSttTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 					/* keep raw text */
 				}
 			}
-			if (!transcript.trim()) return toolError("Transcription returned empty text.", { model });
+			if (!transcript.trim()) return toolError("Transcription returned empty text.", { model }, use());
 
 			const header = [
 				`File: ${abs}`,
@@ -1696,7 +2075,7 @@ function registerSttTool(pi: ExtensionAPI, cfg: ToolsConfigSlice) {
 				file: abs,
 				chars: transcript.length,
 				format: params.response_format || "json",
-			});
+			}, use({ bytes: bytes.length }));
 		},
 		renderResult(result, { expanded }, theme) {
 			const d = (result.details || {}) as { file?: string; chars?: number };

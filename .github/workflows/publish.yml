@@ -1,0 +1,57 @@
+# Publish to npm via OIDC trusted publishing — no tokens, no OTP.
+#
+# Flow: bump package.json → commit → push → GitHub Release (tag vX.Y.Z) →
+# this workflow verifies the tag matches package.json, runs the gates,
+# and publishes. Provenance attestations are automatic with OIDC.
+#
+# One-time browser setup (maintainer): npmjs.com → package Settings →
+# Trusted Publisher → GitHub Actions → user QMahyar, repo pi-9router,
+# workflow file publish.yml, allow `npm publish`.
+
+name: Publish to npm
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  id-token: write # Required for npm OIDC trusted publishing
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # npm CLI performs the OIDC exchange + publish (bun has no equivalent).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Unit tests
+        run: bun test
+
+      - name: Release tag must match package.json version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          echo "tag=${GITHUB_REF_NAME} package=${PKG}"
+          if [ "${GITHUB_REF_NAME}" != "v${PKG}" ]; then
+            echo "Release tag '${GITHUB_REF_NAME}' does not match package.json version 'v${PKG}'. Tag the release as 'v${PKG}'."
+            exit 1
+          fi
+
+      - name: Publish to npm
+        run: npm publish --access public
