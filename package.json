@@ -29,7 +29,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "e2e": "bun run scripts/e2e-test.ts"
+    "e2e": "bun run scripts/e2e-test.ts",
+    "dev-install": "bun run scripts/dev-install.ts"
   },
   "files": [
     "extensions",

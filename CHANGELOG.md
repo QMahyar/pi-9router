@@ -29,7 +29,51 @@ Do **not** put machine-only paths or secrets here — those stay in gitignored `
 
 ## [Unreleased]
 
-### Added (Wayfinder 10x effort — local tracker, not shipped)
+### Added
+
+- File decomposition (the follow-up deferred at 1.2.9): both entry files split
+  into focused `extensions/lib/` modules — `nr-report` (debug + report
+  formatters), `model-caps` (pattern caps table + pi model mapping), `sync`
+  (fetch/enrich/voice/sync), `diagnose`, `model-resolve` (config slice +
+  resolveModel + tool descriptions), `toolkit` (file/error/usage/media
+  helpers), and per-area tool modules. Entry files keep every exported
+  test/script seam; behavior unchanged (one deliberate cleanup: the image
+  fallback chain's final error branch now reports the first stage failure —
+  binary — instead of the confusing url-stage precedence).
+- `formatUsageByTool`: per-tool usage breakdown (count, ok-rate, avg latency,
+  most recently used tool first) shown under both Status surfaces
+  (/9router Status + /9router-tools Status); pure over the usage log, unit
+  tested.
+- `bun run dev-install` (`scripts/dev-install.ts`): copies the whole extension
+  tree (entries + every `lib/*.ts`) into pi's installed package path after a
+  bundle smoke check — the old manual copy only handled `lib/shared.ts` and
+  would have broken the decomposed tree. `--loose` targets the legacy
+  auto-discover path.
+- Decomposition parity audit (11 module audits + adversarial verification, 19
+  agents): 8 findings, 7 confirmed and fixed — `needCap` restored the original
+  spread-merge semantics (a hand-edited `enabled: null` is OFF, not ON) with
+  regression tests; TTS/video result text puts the resolveModel note back
+  after the `Model:` line; the TTS JSON-fallback failure no longer leaks
+  `status` into the thrown error details (usage log still gets it); image
+  fallback filename suffixes are crypto `randomBytes` hex again; the
+  `/9router-tools` Status "By tool:" section wiring actually landed. One
+  finding refuted (STT cwd guard — behavior identical).
+
+### Notes
+
+- 1.2.6–1.2.8 were never published (OTP blocked); 1.2.9 supersedes them and
+  is the first release through the tag-driven OIDC pipeline.
+- Published 2026-09-04 via `Publish to npm` workflow (OIDC, no OTP): git
+  `3c06567`, tag/release `v1.2.9`, npm `latest` = 1.2.9 verified.
+
+---
+
+## [1.2.9] — 2026-09-04
+
+**Git:** `3c06567` · **npm:** `1.2.9` (`latest`; first release through the
+tag-driven OIDC pipeline).
+
+### Added (Wayfinder 10x effort)
 
 - Ticket 01: kind-qualified info cache (`catalogKey`/`lookupInfo` — `kind\0id`
   keys, twin-safe) + 24h negative cache (`infoMissing`, `isInfoMissingCached`)
@@ -70,15 +114,6 @@ Do **not** put machine-only paths or secrets here — those stay in gitignored `
   usage-log rotation (256KB cap → last 1000 lines), honest counter split
   (`formatInfoLine` — probed/hits/misses/cache-hits/negative-skips/rich-skips
   each show their own counter; Status rows split from the triage line).
-- Tests+docs session: +18 tests this session (statusLines stale/Catalog/Stale rows,
-  video stale-default fallback, `videoPollChanged` direct seam,
-  sanitize TTL seams, usage-summary edges, `readUsageRecords` tail/guard,
-  `footerFromConfig`); rewrote 1 tautological test (`fillModelCaps`
-  unknown-id self-comparison → fresh-literal expectation); usage.md
-  infoCache key fix (kind-qualified, not bare-id); dev.md export list +
-  enrich dedupe/abort/progress notes.
-- Constraints: no loose-file install, no `pi install`, no publish (user-owned),
-  no live-config writes, no billed video e2e. Package-path verification only.
 - Video batch: restored `lastProgress` dedup (`videoPollChanged` — polls toast
   only on status/progress advance, ~200 polls/job stay silent) with a
   progress-callback counting test.
@@ -90,18 +125,15 @@ Do **not** put machine-only paths or secrets here — those stay in gitignored `
   the tool description, the `(auto)` status markers, and the result note;
   saved defaults win, all-thin falls back quietly). Status rows now name the
   model that actually runs.
-
-### Verified
-
-- `bun run typecheck` clean · `bun test` 226/226 (was 59 at 1.2.8).
-
-### Added
-
 - Release automation: `.github/workflows/publish.yml` publishes to npm via
   OIDC trusted publishing when a GitHub Release tagged `vX.Y.Z` is published
   (tag must match `package.json`; typecheck + tests re-run first). One-time
   maintainer setup: npmjs.com → package Settings → Trusted Publisher
   (`QMahyar` / `pi-9router` / `publish.yml`). No more OTP publish.
+
+### Verified
+
+- `bun run typecheck` clean · `bun test` 226/226 (was 59 at 1.2.8).
 
 ### Notes
 
@@ -109,12 +141,8 @@ Do **not** put machine-only paths or secrets here — those stay in gitignored `
   `9router-tools.ts` → ~2.1k) — new code went to shared helpers
   (`formatTriageLine`, `isFatalMediaStatus`, `videoCreateError`,
   `planImageBatch`, `videoPollChanged`, `pickAutoDefaultModel`) and pure
-exported seams for testability; full file decomposition deferred to a
+  exported seams for testability; full file decomposition deferred to a
   follow-up so this release stays reviewable as one behavior change.
-- 1.2.6–1.2.8 were never published (OTP blocked); 1.2.9 supersedes them and
-  is the first release through the tag-driven OIDC pipeline.
-- Published 2026-09-04 via `Publish to npm` workflow (OIDC, no OTP): git
-  `3c06567`, tag/release `v1.2.9`, npm `latest` = 1.2.9 verified.
 
 ---
 

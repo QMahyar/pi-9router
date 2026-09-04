@@ -2,13 +2,23 @@
 
 ```text
 extensions/
-  9router.ts         # /9router — sync + chat provider + diagnose
-  9router-tools.ts   # /9router-tools + nr_* tools
+  9router.ts         # /9router entry — config, provider registration, TUI, re-exports
+  9router-tools.ts   # /9router-tools entry — session wiring, re-exports
   lib/
-    shared.ts        # HTTP, timeouts, config merge, CAPS (not an entry point)
+    shared.ts        # HTTP, timeouts, config merge, CAPS, usage log, footer
+    nr-report.ts     # NR_DEBUG gating + triage/info report formatters
+    model-caps.ts    # MODEL_PATTERN_CAPS + pi model mapping + name merge
+    sync.ts          # list fetch, enrich (caches), voice TTS, fetchAllAndBuild
+    diagnose.ts      # diagnoseConnection + formatDiagnose
+    model-resolve.ts # tools config slice, resolveModel, description hints
+    toolkit.ts       # ToolError, usage ctx, output files, truncation, render
+    tools-media.ts   # image/tts/video/stt implementations
+    tools-web.ts     # embed/search/fetch implementations
+    tools-register.ts# tool registration wrappers + /9router-tools TUI
 tests/               # offline unit tests (bun test)
 scripts/
   e2e-test.ts        # live E2E against local 9Router
+  dev-install.ts     # copy the extension tree into pi's package path
 CHANGELOG.md         # cross-session WIP + release history (update every session)
 ```
 
@@ -112,14 +122,19 @@ Exported for testing: `fetchAllAndBuild`, `enrichCatalog`, `diagnoseConnection`,
 plus pure helpers from
 `lib/shared.ts` (`isInfoCacheFresh`, `sanitizeInfoMissing`/`sanitizeInfoCache`/`sanitizeModelNames`,
 `pickAutoDefaultModel`, `capsClassOf`/`capsBadgeOf`, `footerFromConfig`,
-`logUsage`/`readUsageRecords`/`formatUsageSummary`, `fullError` transport) and `globMatch`/`fillModelCaps`/`mapThinkingCompat` from
-`9router.ts`.
+`logUsage`/`readUsageRecords`/`formatUsageSummary`/`formatUsageByTool`, `fullError` transport) and
+`globMatch`/`fillModelCaps`/`mapThinkingCompat` from `lib/model-caps.ts` (all
+re-exported from the entry files — tests/scripts import from
+`extensions/9router.ts` / `extensions/9router-tools.ts` and stay stable across
+internal refactors).
 
 **Usage log.** Every tool call appends one JSON line to `9router-usage.jsonl`
 (`logUsage`, never throws; gate rejections log too); the file is bounded
 (an append past 256KB rewrites just the last 1000 lines).
-`formatUsageSummary` feeds the Status line; corrupt
-lines are skipped on read.
+`formatUsageSummary` feeds the Status summary line and
+`formatUsageByTool` renders the per-tool breakdown (count, ok-rate, avg
+latency, most recently used tool first) shown under both Status surfaces;
+corrupt lines are skipped on read.
 
 ```bash
 # typecheck (strict, no emit)
@@ -147,14 +162,17 @@ and `npm publish --access public` (provenance automatic). One-time maintainer
 setup in the browser: npmjs.com → package Settings → Trusted Publisher →
 GitHub Actions (`QMahyar` / `pi-9router` / `publish.yml`, allow publish).
 
-**Local install (this machine):** copy loose files — do not `pi install` alongside them:
+**Local install (this machine):** the package loads from
+`~/.pi/agent/npm/node_modules/@qmahyar/pi-9router` (installed via
+`pi install npm:@qmahyar/pi-9router`). To test local changes, copy the tree
+with the dev script (bundle-checks first, copies every entry + lib file), then
+`/reload` in pi:
 
 ```bash
-mkdir -p "$USERPROFILE/.pi/agent/extensions/lib"
-cp extensions/9router.ts extensions/9router-tools.ts "$USERPROFILE/.pi/agent/extensions/"
-cp extensions/lib/shared.ts "$USERPROFILE/.pi/agent/extensions/lib/"
+bun run dev-install
 ```
 
-Then `/reload` in pi.
+`pi update` restores the published npm version. Do not mix in loose-file
+copies — two registration paths for the same commands conflict.
 
-Publish: `npm publish --access public --otp=…` from package root.
+Publishing is tag-driven (see Release pipeline above) — never manual `npm publish`.

@@ -647,6 +647,41 @@ export function formatUsageSummary(path: string = USAGE_PATH): string | undefine
 	return bits.join(" · ");
 }
 
+/**
+ * Per-tool usage breakdown from the bounded usage log — one line per tool
+ * with call count, ok-rate, and average latency. Newest tool first by last
+ * call; tools with no records are absent. Pure over readUsageRecords, so it
+ * is locked by unit tests and shared by the /9router and /9router-tools
+ * Status surfaces. Undefined when the log is empty.
+ */
+export function formatUsageByTool(path: string = USAGE_PATH): string[] | undefined {
+	const recs = readUsageRecords(path);
+	if (!recs.length) return undefined;
+	const byTool = new Map<string, UsageEntry[]>();
+	for (const r of recs) {
+		const list = byTool.get(r.tool) ?? [];
+		list.push(r);
+		byTool.set(r.tool, list);
+	}
+	const lines: string[] = [];
+	for (const tool of [...byTool.keys()].sort((a, b) => {
+		// Most recently used tool first; alphabetical tiebreak for stability.
+		const la = byTool.get(a)![byTool.get(a)!.length - 1].ts;
+		const lb = byTool.get(b)![byTool.get(b)!.length - 1].ts;
+		if (la !== lb) return la < lb ? 1 : -1;
+		return a.localeCompare(b);
+	})) {
+		const rs = byTool.get(tool)!;
+		const ok = rs.filter((r) => r.ok).length;
+		const times = rs.filter((r) => typeof r.ms === "number").map((r) => r.ms as number);
+		const avg = times.length ? Math.round(times.reduce((a, b) => a + b, 0) / times.length) : undefined;
+		lines.push(
+			`  ${tool.padEnd(20)} ${String(rs.length).padStart(4)} calls  ${Math.round((ok / rs.length) * 100)}% ok${avg != null ? `  avg ${fmtMs(avg)}` : ""}`,
+		);
+	}
+	return lines.length ? lines : undefined;
+}
+
 // ── Abort / timeout ─────────────────────────────────────────────
 
 /** Combine optional parent signal with a timeout. */

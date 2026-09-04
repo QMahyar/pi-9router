@@ -8,6 +8,7 @@ import {
 	isAutoRichDefault,
 	isFatalMediaStatus,
 	isVideoPassthroughId,
+	needCap,
 	planImageBatch,
 	resolveModel,
 	videoCreateError,
@@ -512,5 +513,24 @@ describe("withModelHint video names the documented default", () => {
 		const h = withModelHint({}, videoCap, "Base.");
 		expect(h).toContain("xai/grok-imagine-video");
 		expect(h).not.toContain("auto default");
+	});
+});
+
+describe("needCap gate semantics", () => {
+	const imageCap = CAPS.find((c) => c.id === "image")!;
+
+	test("missing capability record falls back to the cap default", () => {
+		// image is defaultEnabled → no gate message with no capabilities at all
+		expect(needCap({ catalog: [entry("m/a", "image")] }, imageCap)).toBeNull();
+	});
+	test("stored enabled:null is OFF (original spread-merge semantics)", () => {
+		expect(needCap({ catalog: [entry("m/a", "image")], capabilities: { image: { enabled: null } } as never }, imageCap)).toContain("is off");
+	});
+	test("stored enabled:false is OFF, enabled:true is ON", () => {
+		expect(needCap({ catalog: [entry("m/a", "image")], capabilities: { image: { enabled: false } } }, imageCap)).toContain("is off");
+		expect(needCap({ catalog: [entry("m/a", "image")], capabilities: { image: { enabled: true } } }, imageCap)).toBeNull();
+	});
+	test("enabled cap with an empty catalog asks for a sync", () => {
+		expect(needCap({ catalog: [] }, imageCap)).toContain("Sync");
 	});
 });
