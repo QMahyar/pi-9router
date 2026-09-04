@@ -29,6 +29,15 @@ Do **not** put machine-only paths or secrets here — those stay in gitignored `
 
 ## [Unreleased]
 
+_(empty)_
+
+---
+
+## [1.2.10] — 2026-09-04
+
+**Git:** `58949b5` · **npm:** `1.2.10` (tag-driven OIDC publish; verification
+note to follow once the workflow completes).
+
 ### Added
 
 - File decomposition (the follow-up deferred at 1.2.9): both entry files split
@@ -58,13 +67,6 @@ Do **not** put machine-only paths or secrets here — those stay in gitignored `
   fallback filename suffixes are crypto `randomBytes` hex again; the
   `/9router-tools` Status "By tool:" section wiring actually landed. One
   finding refuted (STT cwd guard — behavior identical).
-
-### Notes
-
-- 1.2.6–1.2.8 were never published (OTP blocked); 1.2.9 supersedes them and
-  is the first release through the tag-driven OIDC pipeline.
-- Published 2026-09-04 via `Publish to npm` workflow (OIDC, no OTP): git
-  `3c06567`, tag/release `v1.2.9`, npm `latest` = 1.2.9 verified.
 
 ---
 
