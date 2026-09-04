@@ -35,8 +35,9 @@ _(empty)_
 
 ## [1.2.10] — 2026-09-04
 
-**Git:** `58949b5` · **npm:** `1.2.10` (tag-driven OIDC publish; verification
-note to follow once the workflow completes).
+**Git:** `5f2f227` · **npm:** `1.2.10` (`latest`; published 2026-09-04 via
+the tag-driven OIDC pipeline — release `v1.2.10`, workflow run 33873236440,
+28s, no OTP/tokens).
 
 ### Added
 
