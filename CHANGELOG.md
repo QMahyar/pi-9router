@@ -375,13 +375,13 @@ tag-driven OIDC pipeline).
 
 | SHA | Summary |
 |-----|---------|
-| `92fda79` | Release 1.2.2: cleaner footer chip and on/off toggle |
-| `33f7249` | Release 1.2.1: smarter sync, image n fix, diagnose, shared HTTP |
-| `cc89691` | Return the image path instead of embedding the image |
-| `46ae50b` | Send the provider name, not the catalog id, to search and fetch |
-| `3bf30e9` | Ignore AGENTS.md |
-| `9879b7b` | Fetch real model names and resolve model ids against the catalog |
-| `d8c53dd` | Release polish: clean agent tools, branding, scoped npm package |
-| `4540ddd` | Remove STT and voice input; document package cleanly |
-| `405107f` | Add 9router-tools |
-| `e28c005` | Add pi-9router extension |
+| `158cf2b` | CHANGELOG: record 1.2.10 OIDC publish (5f2f227, npm latest 1.2.10) |
+| `5f2f227` | Release 1.2.10: lib decomposition, usage breakdown, dev-install, parity-audit fixes |
+| `58949b5` | Decompose entry files into lib modules, usage breakdown, dev-install |
+| `0a453d8` | CHANGELOG: record 1.2.9 OIDC publish (3c06567, npm latest 1.2.9) |
+| `3c06567` | Release 1.2.9: 10x audit fixes, video resolve, caches, 226 tests, tag-driven publish |
+| `48dcd67` | Release 1.2.8: stt cwd, http timer leak, capabilities merge, video abort |
+| `5159315` | Release 1.2.7: video generation (Grok Imagine), nr_stt, multi-image edit, search params |
+| `c578aac` | Release 1.2.6: config atomicity, media tool hardening, typecheck/tests/CI |
+| `782e4c1` | Release 1.2.5: fix model context/metadata registration for caps-less models |
+| `b381da0` | Release 1.2.4: append detected extension to extensionless output filenames |
