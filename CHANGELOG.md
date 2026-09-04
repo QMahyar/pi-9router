@@ -113,6 +113,8 @@ exported seams for testability; full file decomposition deferred to a
   follow-up so this release stays reviewable as one behavior change.
 - 1.2.6–1.2.8 were never published (OTP blocked); 1.2.9 supersedes them and
   is the first release through the tag-driven OIDC pipeline.
+- Published 2026-09-04 via `Publish to npm` workflow (OIDC, no OTP): git
+  `3c06567`, tag/release `v1.2.9`, npm `latest` = 1.2.9 verified.
 
 ---
 
